@@ -20,6 +20,7 @@ enum MTFlags
 {
 	MT_FLAG_BATTLE = 1,
 	MT_FLAG_NO_AI = 2, // lev has no nav paths: arcade bots would have nowhere to drive
+	MT_FLAG_REMASTER = 4, // Nitro-Fueled track: the stock level, drawn by the native ray tracer from assets/rtx_remaster
 };
 
 struct MTEntry
@@ -43,7 +44,9 @@ struct MTState
 	int magic;         // MT_MAGIC once the menu has initialised this struct
 	int redirectLevel; // host levelID to redirect, -1 = none
 	int redirectBase;  // bigfile index replacing levelID*8
-	short cursor[2];   // list cursor for race / battle lists
+	short cursor[2][3]; // list cursor for race / battle lists, per track set (MT_TrackSelect.c)
+	short set[2];       // track set shown for race / battle: 0 stock, 1 Nitro-Fueled, 2 custom
+	short entry;        // table index + 1 of the redirected track (0: find it by redirectBase; NF tracks on a stock slot share its entries)
 };
 
 extern struct MTState gMTState;
