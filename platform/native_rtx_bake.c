@@ -222,7 +222,8 @@ static void Bake_Write(int i, int baked)
 
 int Rtx_BakedEnabled(void)
 {
-	return NativeSettings_GetInt("baked_rt", 1) != 0;
+	const char *env = getenv("CTR_BAKED_RT"); // (test harness: on / off without touching settings.ini)
+	return env ? (atoi(env) != 0) : (NativeSettings_GetInt("baked_rt", 1) != 0);
 }
 
 void Rtx_SetBakedEnabled(int on)
