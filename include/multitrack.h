@@ -58,4 +58,27 @@ struct MTEntry *MT_ActiveEntry(void);
 // CTR_BOOT_LEVEL / CTR_BOOT_TRACK env: boot straight into a level (debug, screenshots)
 int MT_BootLevel(int defaultLevel);
 
+// CTR_SHOT_CLEAN=1 (scripts/track_shots.py): no HUD (nor its models), no karts,
+// no particles; the frame is
+// written once the race-start camera has settled
+int MT_ShotClean(void);
+void MT_ShotTick(void);
+struct GameTracker;
+void MT_Settings_Tick(struct GameTracker *gGT); // main menu Settings (MT_Settings.c), before the menu's input
+int MT_Settings_HidesMenu(void);                // Settings open: no menu under it this frame
+
+// Nitro-Fueled collision (MT_NfColl.c): NF tracks collide with the NF level's triangles
+struct Level;
+struct BSP;
+struct BoundingBox;
+struct ScratchpadStruct;
+struct QuadBlock;
+struct LevVertex;
+void MT_Coll_OnLevelLoaded(struct Level *lev);
+struct BSP *MT_Coll_Root(struct BSP *root);
+int MT_Coll_SearchWide(struct BSP *root, struct BoundingBox *bbox, void (*callback)(struct BSP *, struct ScratchpadStruct *), struct ScratchpadStruct *sps);
+struct LevVertex *MT_Coll_QuadVerts(struct LevVertex *levelVerts, const struct QuadBlock *quad);
+int MT_Coll_IsTriangle(const struct QuadBlock *quad);
+int MT_Coll_On(void); // karts collide with an NF collision mesh (no kart seating then)
+
 #endif

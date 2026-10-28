@@ -56,7 +56,22 @@ void MainFrame_RenderFrame(struct GameTracker *gGT, struct GamepadSystem *gGamep
 		RECTMENU_CollectInput();
 	}
 
-	if (sdata->ptrActiveMenu != 0)
+	MT_Settings_Tick(gGT); // MultiTrack: the main menu's Settings take the input while focused
+
+	if ((sdata->ptrActiveMenu != 0) && MT_Settings_HidesMenu())
+	{
+		// MultiTrack: Settings open: the menu not drawn (its backdrop, the flag
+		// and the scene, as RECTMENU_ProcessState keeps them on)
+		if (!(sdata->ptrActiveMenu->state & RECTMENU_UNKNOWN_0x800))
+		{
+			if (!RaceFlag_GetCanDraw())
+			{
+				RaceFlag_SetCanDraw(1);
+			}
+			gGT->renderFlags |= RENDER_FLAG_RENDER_BUCKET;
+		}
+	}
+	else if (sdata->ptrActiveMenu != 0)
 	{
 		if (sdata->Loading.stage == LOAD_IDLE)
 		{

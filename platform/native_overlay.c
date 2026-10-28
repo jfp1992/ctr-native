@@ -4,6 +4,7 @@
 
 #include "platform/native_overlay.h"
 #include "platform/native_rtx.h"
+#include "platform/native_settings.h"
 
 #include <SDL3/SDL.h>
 
@@ -73,7 +74,7 @@ static void Overlay_BuildText(char *buf, int size)
 	                 "F8  load state     Shift+F5 save state\n"
 	                 "F9  replay start   F10 replay stop\n"
 	                 "F11 fullscreen                %s\n"
-	                 "Shift+F6 gamepad -> next player\n"
+	                 "Shift+F6 gamepad -> next player   Ctrl+F6 RT probe -> rtx_probe.txt\n"
 	                 "Shift+F7 save VRAM.TGA   PrtSc SCREENSHOT.BMP\n",
 	                 fps, Overlay_OnOff(g_dbg_wireframeMode), Overlay_OnOff(g_dbg_texturelessMode), Overlay_OnOff(g_cfg_bilinearFiltering),
 	                 Rtx_KeyStatus(SDL_SCANCODE_F5), Rtx_KeyStatus(SDL_SCANCODE_F6), Rtx_KeyStatus(SDL_SCANCODE_F7), Overlay_OnOff(fullscreen));
@@ -92,13 +93,20 @@ const u8 *Overlay_Rasterize(int *w, int *h)
 		s_overlay.frameMs = (s_overlay.frameMs > 0.0f) ? 0.95f * s_overlay.frameMs + 0.05f * ms : ms;
 	}
 	s_overlay.lastFrameNs = now;
-	if (!s_overlay.open)
+	char text[OVERLAY_ROWS * (OVERLAY_COLS + 1) + 1];
+	if (s_overlay.open)
+	{
+		Overlay_BuildText(text, sizeof(text));
+	}
+	else if (NativeSettings_GetInt("fps_counter", 0))
+	{
+		// (Settings "FPS counter": just the frame rate, in the same corner)
+		snprintf(text, sizeof(text), "%.0f fps %.1f ms", (s_overlay.frameMs > 0.0f) ? 1000.0f / s_overlay.frameMs : 0.0f, s_overlay.frameMs);
+	}
+	else
 	{
 		return NULL;
 	}
-
-	char text[OVERLAY_ROWS * (OVERLAY_COLS + 1) + 1];
-	Overlay_BuildText(text, sizeof(text));
 
 	// size to the text: columns of the longest line, rows used
 	int cols = 0, rows = 0, col = 0;

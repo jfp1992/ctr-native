@@ -36,6 +36,21 @@ void Rtx_HandleKey(int scancode);
 const char *Rtx_KeyStatus(int scancode);  // F5 / F6 / F7 state, for the F12 overlay
 int Rtx_OverlayText(char *buf, int size); // renderer settings and timings
 void Rtx_OverlayKey(int digit, int back);  // overlay keys 1-8 step a setting
+int Rtx_Supported(void);   // the renderer runs (0: not started, or the GPU can't ray trace)
+int Rtx_Enabled(void);     // F7 / Settings menu: ray tracing on
+void Rtx_SetEnabled(int on);
+int Rtx_GetSpp(void);      // samples per pixel (RTX_MIN_SPP..RTX_MAX_SPP in steps of RTX_SPP_STEP)
+void Rtx_SetSpp(int spp);
+// baked ray traced lighting for the GL renderer (native_rtx_bake.c)
+void Rtx_BakeFrame(void);        // each frame first: the loaded levels' bakes in or out
+int Rtx_BakedEnabled(void);      // Settings "Baked RT"
+void Rtx_SetBakedEnabled(int on);
+void Rtx_BakeStart(void);        // "Bake now": every level not baked yet
+void Rtx_BakeStop(void);         // after the level being baked
+void Rtx_BakeTick(void);         // a step of it (each menu frame)
+int Rtx_BakeRunning(void);
+void Rtx_BakeProgress(int *done, int *total, const char **name);
+void Rtx_BakeShutdown(void);
 
 // game hooks
 void Rtx_FrameBegin(void);
