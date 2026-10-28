@@ -3821,9 +3821,14 @@ static void bakeVertexLight(void)
 				pred[ch] += b[BAKE_LIGHTS + 1 + k * 2] * lightData[(j - 1) * 12 + 4 + ch];
 			}
 		}
+		// the art's tint only for its colour: its brightness is what the fit
+		// left over of the PS1's own lighting, and taking it would give the PS1
+		// look back; the traced light (shadows, sky, bounce) is the brightness
+		float tl = luma3(&tint[v * 4]);
 		for (int k = 0; k < 3; k++)
 		{
-			lin[v * 3 + k] = tint[v * 4 + k] * pred[k];
+			float chroma = (tl > 1e-3f) ? tint[v * 4 + k] / tl : 1.0f;
+			lin[v * 3 + k] = (chroma < 0.25f ? 0.25f : (chroma > 4.0f ? 4.0f : chroma)) * pred[k];
 		}
 		if (!s_bakeKeep[v] && (tint[v * 4 + 3] <= 0.0f))
 		{

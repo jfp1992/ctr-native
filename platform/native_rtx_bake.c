@@ -16,7 +16,7 @@
 
 #define BAKE_DIR      "rtbake"
 #define BAKE_MAGIC    0x42525443u // 'CTRB'
-#define BAKE_VERSION  1u
+#define BAKE_VERSION  2u // (2: the traced light's own brightness, not the art's)
 #define BAKE_RAYS     64u
 #define BAKE_MAX_JOBS 1024
 #define BAKE_RECORDS  4
@@ -198,18 +198,22 @@ static void Bake_Write(int i, int baked)
 	int n = s_bakeRec[i].numVerts;
 	if (baked && (s_bakeRec[i].orig == NULL))
 	{
-		s_bakeRec[i].orig = malloc((size_t)n * 3 + 1);
+		// (both colour sets: the far, low detail quads draw color_lo)
+		s_bakeRec[i].orig = malloc((size_t)n * 6 + 1);
 		for (int v = 0; v < n; v++)
 		{
-			memcpy(&s_bakeRec[i].orig[v * 3], va[v].color_hi, 3);
+			memcpy(&s_bakeRec[i].orig[v * 6], va[v].color_hi, 3);
+			memcpy(&s_bakeRec[i].orig[v * 6 + 3], va[v].color_lo, 3);
 			memcpy(va[v].color_hi, &s_bakeRec[i].baked[v * 3], 3);
+			memcpy(va[v].color_lo, &s_bakeRec[i].baked[v * 3], 3);
 		}
 	}
 	else if (!baked && (s_bakeRec[i].orig != NULL))
 	{
 		for (int v = 0; v < n; v++)
 		{
-			memcpy(va[v].color_hi, &s_bakeRec[i].orig[v * 3], 3);
+			memcpy(va[v].color_hi, &s_bakeRec[i].orig[v * 6], 3);
+			memcpy(va[v].color_lo, &s_bakeRec[i].orig[v * 6 + 3], 3);
 		}
 		free(s_bakeRec[i].orig);
 		s_bakeRec[i].orig = NULL;
