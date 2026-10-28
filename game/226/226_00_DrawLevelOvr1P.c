@@ -7327,6 +7327,7 @@ static void DrawLevelOvr1P_SetViewportScratchContext(struct PushBuffer *pb, cons
 	DrawLevelOvr1P_SetClipRecordStart(clipStart);
 	DrawLevelOvr1P_SetRenderedOverflowBase(renderedOverflowBase);
 	Ovr226_800a0d34_SetEntryGteAndCameraScratch(pb);
+	Rtx_SetCaptureView(pb); // MultiTrack: split screen draws the views in turn
 }
 
 static void DrawLevelOvr_ClearRenderedOverflowBase(int playerIndex)

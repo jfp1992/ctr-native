@@ -1022,12 +1022,15 @@ void RenderAllLevelGeometry(struct GameTracker *gGT, struct Level *level1, struc
 		{
 			gGT->bspLeafsDrawn += RenderLists_Init1P2P(ptr_mesh_info->bspRoot, gGT->visMem1->visLeafList[i], &gGT->pushBuffer[i], (u32)&gGT->LevRenderLists[i],
 			                                           gGT->visMem1->bspList[i], numPlyrCurrGame);
+			Rtx_OnLevelCamera(&gGT->pushBuffer[i]); // MultiTrack
 		}
 
 		// 226-229
+		Rtx_BeginTag(RTX_TAG_LEVEL, &gGT->backBuffer->primMem); // MultiTrack
 		DrawLevelOvr2P(&gGT->LevRenderLists[0], &gGT->pushBuffer[0], (struct BSP *)ptr_mesh_info, &gGT->backBuffer->primMem, gGT->visMem1->visFaceList[0],
 		               gGT->visMem1->visFaceList[1],
 		               level1->ptr_tex_waterEnvMap); // waterEnvMap?
+		Rtx_EndTag(&gGT->backBuffer->primMem);
 
 		goto SkyboxGlow;
 	}
@@ -1060,7 +1063,10 @@ void RenderAllLevelGeometry(struct GameTracker *gGT, struct Level *level1, struc
 	{
 		gGT->bspLeafsDrawn += RenderLists_Init3P4P(ptr_mesh_info->bspRoot, gGT->visMem1->visLeafList[i], &gGT->pushBuffer[i], (u32)&gGT->LevRenderLists[i],
 		                                           gGT->visMem1->bspList[i]);
+		Rtx_OnLevelCamera(&gGT->pushBuffer[i]); // MultiTrack
 	}
+
+	Rtx_BeginTag(RTX_TAG_LEVEL, &gGT->backBuffer->primMem); // MultiTrack
 
 	if (numPlyrCurrGame == 3)
 	{
@@ -1077,6 +1083,7 @@ void RenderAllLevelGeometry(struct GameTracker *gGT, struct Level *level1, struc
 		               gGT->visMem1->visFaceList[1], gGT->visMem1->visFaceList[2], gGT->visMem1->visFaceList[3],
 		               level1->ptr_tex_waterEnvMap); // waterEnvMap?
 	}
+	Rtx_EndTag(&gGT->backBuffer->primMem);
 
 SkyboxGlow:
 

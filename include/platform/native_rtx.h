@@ -62,10 +62,15 @@ void Rtx_BeginScaled(struct PrimMem *primMem, struct PushBuffer *pb, float viewS
 struct Icon;
 void Rtx_OnParticle(struct PushBuffer *pb, s32 viewX4, s32 viewY4, s32 viewZ4, u32 color, const struct Icon *icon);
 void Rtx_OnParticleDepth(struct PushBuffer *pb, u32 *prim, int words, s32 viewZ4, s32 ofx, s32 ofy, s32 h); // GTE OFX/OFY (16.16), H
-void Rtx_OnLevelCamera(struct PushBuffer *pb);
+void Rtx_OnLevelCamera(struct PushBuffer *pb); // each player's view (split screen: every player's)
+void Rtx_SetCaptureView(struct PushBuffer *pb); // level overlays: the player's view being drawn
 int Rtx_LevelLodScale(int depth); // level LOD distances scaled to the output resolution while ray tracing
 void Rtx_SetTextureNearDepth(int depth); // past it the PS1 uses lower textures: the renderer uses the mesh's near ones
 void Rtx_OnProject(u32 sxy, s32 mac1, s32 mac2, s32 mac3, int sf);
+int Rtx_WantsCulledTris(void); // ray tracing: model triangles the PS1 culls go to the ray tracer (Rtx_CaptureCulledTri)
+void Rtx_SetRtxOnlyInstance(int on); // the instance being drawn is outside the view: all its triangles ray traced only
+int Rtx_RtxOnlyInstance(void);
+void Rtx_CaptureCulledTri(const u32 *gteRT, const u32 *packedXY, const u32 *packedZ, int textured, const u32 *texWords, const int *colors);
 
 // GPU hooks
 int Rtx_FrameActive(void);
