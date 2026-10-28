@@ -64,7 +64,7 @@ typedef struct
 	VkDeviceAddress addr;
 } Accel;
 
-// mirrors FrameBuf in shaders/common.glsl (std430, vec4 aligned)
+// mirrors View in shaders/common.glsl: one player's camera
 typedef struct
 {
 	float rInv[3][4];
@@ -1625,6 +1625,14 @@ static void loadLighting(const char *key)
 	R.ambientSet = 0;
 	struct RtxLighting *L = &R.light;
 	char path[1400];
+	// Nitro-Fueled tracks (nf-<slot>) play the stock level: its file is the base
+	char base[64];
+	int slot;
+	if (sscanf(key, "nf-%d", &slot) == 1)
+	{
+		snprintf(base, sizeof(base), "stock-%d", slot);
+		key = base;
+	}
 	snprintf(path, sizeof(path), "%s/assets/rtx_lights/%s.txt", s_exeDir, key);
 	FILE *f = fopen(path, "r");
 	if (!f)
@@ -1722,7 +1730,7 @@ static void smokeFaceSun(struct RtxDynTri *tris, uint32_t n, const float *sun)
 // models: weld corners at the same position within one object. The PS1 only
 // emits camera-facing polygons (back faces are culled), so every face normal is
 // turned towards the camera before it is summed: consistent across the model
-static void dynSmoothNormals(const struct RtxDynTri *tris, uint32_t n, float *out, const float *camPos)
+static void dynSmoothNormals(const struct RtxDynTri *tris, uint32_t n, float *out, const float (*camPos)[3], uint32_t numCams)
 {
 	enum
 	{
@@ -1957,7 +1965,23 @@ static void clusterShape(const Cluster *c, float *centre, float *normal, float *
 // ones such as lamp bulbs) -> point lights per 300-unit cluster with the power
 // they emit.
 // Opaque glowing triangles are flagged emissive (shown as the PS1 draws them).
-static void addGlowLights(const struct RtxLevelVert *verts, struct RtxLevelTri *tris, uint32_t nt, float *lightData)
+// remaster (a Nitro-Fueled track): only the PS1 level's lava, to measure the
+// light the stock track gives it (levelPrep); no additive glows
+static int nearRemasterLight(const float *p, float dist, float kind)
+{
+	for (uint32_t i = 0; i < R.remNumLights; i++)
+	{
+		const float *l = &R.remLights[i * 8];
+		float dx = l[0] - p[0], dy = l[1] - p[1], dz = l[2] - p[2];
+		if ((fabsf(l[7] - kind) < 0.5f) && (dx * dx + dy * dy + dz * dz < dist * dist))
+		{
+			return 1;
+		}
+	}
+	return 0;
+}
+
+static void addGlowLights(const struct RtxLevelVert *verts, struct RtxLevelTri *tris, uint32_t nt, float *lightData, int remaster)
 {
 	const struct RtxTexSlot *slots = (const void *)(R.shm + RTX_OFF_TEX_SLOTS);
 	enum
@@ -2024,7 +2048,7 @@ static void addGlowLights(const struct RtxLevelVert *verts, struct RtxLevelTri *
 		float pmax = fmaxf(ps1[0], fmaxf(ps1[1], ps1[2])), pmin = fminf(ps1[0], fminf(ps1[1], ps1[2]));
 		int vivid = (luma3(ps1) >= 0.08f) && (pmax - pmin >= 0.25f * pmax); // grey/white glows are sparkle, foam, highlights
 		float strength;
-		if ((blend == 1) && vivid)
+		if ((blend == 1) && vivid && !remaster)
 		{
 			strength = 1.0f; // additive: drawn as light
 		}
@@ -2089,6 +2113,16 @@ static void addGlowLights(const struct RtxLevelVert *verts, struct RtxLevelTri *
 		float centre[3], normal[3], radius;
 		clusterShape(&cl[c], centre, normal, &radius);
 		float falloff = fmaxf(200.0f, radius * 1.5f);
+		if (remaster)
+		{
+			// only lava (lava-coloured: yellow-orange to red, little blue) and not
+			// where the NF level has a lamp (torches)
+			const double *e = cl[c].e;
+			if (!((e[0] > 1.1 * e[1]) && (e[0] > 2.5 * e[2])) || nearRemasterLight(centre, 300.0f, 0.0f))
+			{
+				continue;
+			}
+		}
 		float color[3];
 		// point light with the cluster's intensity: f^2 * color = power / pi (far field)
 		for (int k = 0; k < 3; k++)
@@ -2817,10 +2851,12 @@ static void loadLevel(void)
 	cmdSubmitWait();
 
 	loadLighting(R.hdr->lightsKey);
+	loadRemaster(R.hdr->lightsKey);
 	R.numLights = 0;
 	R.gridDim[0] = R.gridDim[1] = R.gridDim[2] = 0;
 	R.levelPrep = 1;
 	R.haveLevel = 1;
+	R.modelGain = 0.0f; // (measured again on the new level)
 	R.havePrev = 0;
 	R.autoExposure = 0.0f;
 	R.levelGen = R.hdr->levelGen;
@@ -2860,6 +2896,7 @@ static void dispatchOnce(VkPipeline pipe, uint32_t groups, int step)
 {
 	vkCmdBindPipeline(R.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
 	vkCmdBindDescriptorSets(R.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, R.pipeLayout, 0, 1, &R.sets[0][PASS_TRACE], 0, NULL);
+	vkCmdBindDescriptorSets(R.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, R.pipeLayout, 1, 1, &R.remSet, 0, NULL);
 	vkCmdPushConstants(R.cmd, R.pipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, 4, &step);
 	vkCmdDispatch(R.cmd, groups ? groups : 1, 1, 1);
 }
@@ -3448,6 +3485,29 @@ static void levelPrep(void)
 		R.skyValid = (scale > 0.0f) && (scale <= 8.0f);
 		logf_(R.skyValid ? "sky from the level's skybox colours (x%.2f)" : "skybox too dark to light with (x%.2f): fitted sky colour", scale);
 	}
+	// Nitro-Fueled track with a skybox: its cube map is the sky (seen and lighting),
+	// as bright as the fitted sky light
+	R.remSkyScale = 0.0f;
+	if (sun && R.remActive && R.remSkyView)
+	{
+		double avg = 0.0;
+		for (int c = 0; c < 32; c++)
+		{
+			avg += luma3(R.remSkyTable[c]) / 32.0;
+		}
+		float scale = (avg > 1e-4) ? (float)((luma3(L->skyHorizon) / 0.9f) / avg) : 0.0f;
+		for (int c = 0; c < 64; c++)
+		{
+			for (int k = 0; k < 3; k++)
+			{
+				R.sky[c][k] = R.remSkyTable[c][k] * scale * (c >= 32 ? 0.5f : 1.0f);
+			}
+			R.sky[c][3] = 0.0f;
+		}
+		R.skyValid = (scale > 0.0f) && (scale <= 16.0f);
+		R.remSkyScale = R.skyValid ? scale : 0.0f;
+		logf_("sky from the Nitro-Fueled skybox (x%.2f)", scale);
+	}
 
 	// static lights: lights file, glowing surfaces, lamp pools
 	float *lightData = R.lightsStage.map;
@@ -3459,13 +3519,51 @@ static void levelPrep(void)
 	}
 	R.numFileLights = R.numLights;
 	double tpGlow0 = nowMs();
-	addGlowLights(verts, tris, nt, lightData);
+	// Nitro-Fueled track: its own point lights (added after the art fit below)
+	// instead of what the PS1 art glows with (lamps, water sparkles: they sit
+	// where the PS1 polygons were). If it has lava (nf_level.py glow light kind
+	// 2), the PS1 level's lava and the lamp pools the art paints round it are
+	// placed and fitted to the art as on the stock track, only to measure how
+	// much light the lava gives there: the NF lava lights, where the NF lava
+	// is (its lava is laid out differently), get that much in all
+	int nfLava = 0;
+	for (uint32_t i = 0; R.remActive && (i < R.remNumLights); i++)
+	{
+		nfLava |= R.remLights[i * 8 + 7] > 1.5f;
+	}
+	R.numGlowLights = 0;
+	uint32_t firstGlow = R.numLights;
+	if (!R.remActive || nfLava)
+	{
+		addGlowLights(verts, tris, nt, lightData, R.remActive);
+	}
 	markIce(verts, tris, nt);
 	uint32_t firstHot = R.numLights;
-	if (R.hotspots)
+	if (R.hotspots && (!R.remActive || (R.numGlowLights > 0)))
 	{
 		double tpHot0 = nowMs();
 		addHotspots(verts, used, nv, baseline, lightData);
+		if (R.remActive)
+		{
+			// the pools within reach of those glows
+			uint32_t kept = firstHot;
+			for (uint32_t l = firstHot; l < R.numLights; l++)
+			{
+				const float *d = &lightData[l * 12];
+				int near = 0;
+				for (uint32_t g = firstGlow; (g < firstGlow + R.numGlowLights) && !near; g++)
+				{
+					const float *e = &lightData[g * 12];
+					float dx = d[0] - e[0], dy = d[1] - e[1], dz = d[2] - e[2];
+					near = dx * dx + dy * dy + dz * dz < 1500.0f * 1500.0f;
+				}
+				if (near)
+				{
+					memmove(&lightData[kept++ * 12], d, 48);
+				}
+			}
+			R.numLights = kept;
+		}
 		if (getenv("CTR_RTX_DEBUG"))
 		{
 			logf_("  (prep: lamp pools %.0f ms)", nowMs() - tpHot0);
@@ -3490,7 +3588,7 @@ static void levelPrep(void)
 	memcpy(lightData, R.lightsReadback.map, (size_t)R.numLights * 48);
 
 	// lamp pool strengths, then the grid that finds lights near a point
-	if (R.hotspots)
+	if (R.hotspots && (numHot > 0))
 	{
 		double tpFit0 = nowMs();
 		fitHotspots(verts, nv, lightData, firstHot, numHot);
@@ -3502,9 +3600,79 @@ static void levelPrep(void)
 	double tpGrid0 = nowMs();
 	buildLightGrid(verts, nv, lightData);
 	double tpArt0 = nowMs();
+	// (Nitro-Fueled tracks too: the PS1 art still sets the sun / sky balance)
 	fitArt(verts, tris, nv, nt, used, lightData);
-	double tpArt1 = nowMs();
+	// (NF: the stock lava's fitted light, power ~ colour x falloff^2, against the
+	// NF lava lights' near it (the NF level has more lava, further off: Mystery
+	// Caves' was as strong in all but a quarter dimmer by the lava), and its
+	// colour (stock: orange; NF's emission: redder); then the PS1 lights make
+	// room for the NF level's)
+	double ps1Lava = 0.0, nfLavaPower = 0.0, ps1Rgb[3] = {0, 0, 0}, nfRgb[3] = {0, 0, 0};
+	for (uint32_t l = firstGlow; R.remActive && (l < R.numLights); l++)
+	{
+		const float *d = &lightData[l * 12];
+		double f2 = (double)d[7] * d[7];
+		ps1Lava += luma3(&d[4]) * f2;
+		for (int k = 0; k < 3; k++)
+		{
+			ps1Rgb[k] += d[4 + k] * f2;
+		}
+	}
+	for (uint32_t i = 0; R.remActive && (i < R.remNumLights); i++)
+	{
+		const float *l = &R.remLights[i * 8];
+		int near = 0;
+		for (uint32_t g = firstGlow; (l[7] > 1.5f) && (g < firstGlow + R.numGlowLights) && !near; g++)
+		{
+			const float *e = &lightData[g * 12];
+			float dx = l[0] - e[0], dy = l[1] - e[1], dz = l[2] - e[2];
+			near = dx * dx + dy * dy + dz * dz < 1500.0f * 1500.0f;
+		}
+		if (!near)
+		{
+			continue;
+		}
+		float f = fmaxf(l[3] * 0.35f, 50.0f);
+		nfLavaPower += luma3(&l[4]) * 2.0 * f * f;
+		for (int k = 0; k < 3; k++)
+		{
+			nfRgb[k] += l[4 + k] * 2.0 * f * f;
+		}
+	}
+	float lavaScale = (nfLavaPower > 0.0) ? (float)fmin(fmax(ps1Lava / nfLavaPower, 1.0), 50.0) : 1.0f;
+	// the stock lava's colour over the NF lava's (each light's luma kept)
+	float lavaTint[3] = {1.0f, 1.0f, 1.0f};
+	for (int k = 0; (k < 3) && (ps1Lava > 0.0) && (nfLavaPower > 0.0); k++)
+	{
+		double want = ps1Rgb[k] / ps1Lava, have = nfRgb[k] / nfLavaPower;
+		lavaTint[k] = (have > 1e-6) ? (float)fmin(fmax(want / have, 0.25), 4.0) : 1.0f;
+	}
+	if (R.remActive)
+	{
+		R.numLights = firstGlow;
+	}
+	for (uint32_t i = 0; R.remActive && (i < R.remNumLights) && (R.numLights < RTX_MAX_LIGHTS); i++)
+	{
+		const float *l = &R.remLights[i * 8];
+		float k = (l[7] > 1.5f) ? 2.0f * lavaScale : 2.0f;
+		float col[3] = {l[4] * k, l[5] * k, l[6] * k};
+		if (l[7] > 1.5f)
+		{
+			float y = luma3(col);
+			for (int c = 0; c < 3; c++)
+			{
+				col[c] *= lavaTint[c];
+			}
+			float y2 = luma3(col);
+			for (int c = 0; (c < 3) && (y2 > 0.0f); c++)
+			{
+				col[c] *= y / y2;
+			}
+		}
+		putLight(&lightData[R.numLights++ * 12], l, 0.0f, col, fmaxf(l[3] * 0.35f, 50.0f), 20.0f, NULL);
+	}
 	buildLightGrid(verts, nv, lightData);
+	double tpArt1 = nowMs();
 	if (getenv("CTR_RTX_DEBUG"))
 	{
 		logf_("  (prep: sun fit %.0f ms, before glows %.0f ms, light grid %.0f ms, art fit %.0f ms)", tpSun - tp0, tpGlow0 - tpSun, tpArt0 - tpGrid0, tpArt1 - tpArt0);
@@ -3512,6 +3680,18 @@ static void levelPrep(void)
 	cmdBegin();
 	copyBuf(&R.lightsStage, &R.lights, (VkDeviceSize)R.numLights * 48);
 	cmdSubmitWait();
+	if (getenv("CTR_RTX_DUMP_LIGHTS"))
+	{
+		// diagnostics: u32 count, first glow, first pool; then the lights (12 floats each)
+		FILE *df = fopen(getenv("CTR_RTX_DUMP_LIGHTS"), "wb");
+		if (df)
+		{
+			uint32_t h[3] = {R.numLights, firstGlow, firstHot};
+			fwrite(h, 4, 3, df);
+			fwrite(lightData, 48, R.numLights, df);
+			fclose(df);
+		}
+	}
 
 	if (getenv("CTR_RTX_DEBUG"))
 	{
@@ -3894,8 +4074,8 @@ static void initFrameBuffers(void)
 	R.dynPosStage = bufCreate(RTX_MAX_DYN_TRIS * 36, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, HOST_MEM);
 	R.dynNormals = bufCreate(RTX_MAX_DYN_TRIS * 48, USAGE_STORAGE, DEVICE_LOCAL);
 	R.dynNormalsStage = bufCreate(RTX_MAX_DYN_TRIS * 48, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, HOST_MEM);
-	R.lights = bufCreate((RTX_MAX_LIGHTS + RTX_MAX_DYN_LIGHTS) * 48, USAGE_STORAGE, DEVICE_LOCAL);
-	R.lightsStage = bufCreate((RTX_MAX_LIGHTS + RTX_MAX_DYN_LIGHTS) * 48, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, HOST_MEM);
+	R.lights = bufCreate((RTX_MAX_LIGHTS + RTX_MAX_DYN_LIGHTS + RTX_MAX_PROXY) * 48, USAGE_STORAGE, DEVICE_LOCAL);
+	R.lightsStage = bufCreate((RTX_MAX_LIGHTS + RTX_MAX_DYN_LIGHTS + RTX_MAX_PROXY) * 48, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, HOST_MEM);
 	R.lightsReadback = bufCreate(RTX_MAX_LIGHTS * 48, VK_BUFFER_USAGE_TRANSFER_DST_BIT, HOST_MEM | VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
 	R.cacheKeys = bufCreate((VkDeviceSize)CACHE_ENTRIES * 8, USAGE_STORAGE, DEVICE_LOCAL);
 	R.cacheAccum = bufCreate((VkDeviceSize)CACHE_ENTRIES * 16, USAGE_STORAGE, DEVICE_LOCAL);
@@ -3925,7 +4105,7 @@ static void initFrameBuffers(void)
 	                                                   .flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR,
 	                                                   .geometryCount = 1,
 	                                                   .pGeometries = &g};
-	uint32_t maxInst = 4;
+	uint32_t maxInst = TLAS_MAX_INST;
 	VkAccelerationStructureBuildSizesInfoKHR sizes = {VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR};
 	vkGetAccelerationStructureBuildSizesKHR(R.dev, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &bi, &maxInst, &sizes);
 	accelCreate(&R.tlas, VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR, sizes.accelerationStructureSize);
@@ -4141,6 +4321,32 @@ static void renderFrame(void)
 	F->feat[0] = H->settings.texFilter;
 	F->feat[1] = H->settings.specular;
 	F->feat[2] = H->settings.fog;
+	F->rem[0] = R.remStart[REM_ALPHA];
+	F->rem[1] = R.remStart[REM_GRASS];
+	F->rem[2] = R.remStart[REM_DECAL];
+	static int nmFlip = -1; // CTR_RTX_NM_FLIPY=1: normal maps' green channel the other way up
+	if (nmFlip < 0)
+	{
+		nmFlip = getenv("CTR_RTX_NM_FLIPY") ? (atoi(getenv("CTR_RTX_NM_FLIPY")) != 0) : 0;
+	}
+	F->rem[3] = (R.remActive && R.remSkyView ? 1u : 0u) | (R.remDyn ? 2u : 0u) | (nmFlip ? 4u : 0u) | (R.remWind ? 8u : 0u) | (baked ? 16u : 0u);
+	F->rem2[0] = R.remGrassVert;
+	F->rem2[1] = R.remNumVerts;
+	F->rem3[0] = R.remStart[REM_ANIM];
+	F->rem3[1] = R.remStart[REM_PROXY];
+	F->rem3[2] = R.remAnimVert;
+	F->rem3[3] = R.remNumParts;
+	remProxyFrame(H, F->proxy);
+	{
+		// wind: CGlobalWindData's strength, gusting between its min and max
+		float secs = (float)R.frameIndex / 30.0f;
+		const float *w = R.remWindParams;
+		float gust = 0.5f + 0.25f * sinf(secs * 6.2831853f * fmaxf(w[1], 0.02f)) + 0.25f * sinf(secs * 1.7f + 1.3f);
+		F->wind[0] = secs;
+		F->wind[1] = fmaxf(w[0], 0.0f) * (1.0f + w[2] + (w[3] - w[2]) * gust);
+		F->wind[2] = R.remSkyScale;
+	}
+	F->wind[3] = R.remActive ? 0.0f : R.modelGain; // (remaster tracks: their level isn't the PS1's)
 	F->size[2] = R.frameIndex++;
 	F->size[3] = H->debugView;
 
@@ -4160,7 +4366,8 @@ static void renderFrame(void)
 	// right; trace.comp measures how bright the PS1 drew the frame vs the traced
 	// one and it follows that
 	float exposure = (L->exposure > 0.0f) ? L->exposure : ((R.autoExposure > 0.0f) ? R.autoExposure : 1.0f);
-	int hybrid = (H->lightMode == 0);
+	// (a remaster mesh has no PS1 vertex light to keep: always fully relit)
+	int hybrid = (H->lightMode == 0) && !R.remActive;
 	F->sunColor[3] = hybrid ? 1.0f : exposure; // hybrid: the PS1 colours as they are
 	F->skyZenith[3] = 0.0f;
 	F->skyHorizon[3] = 2.0f;   // ray epsilon (level units)
@@ -4176,8 +4383,9 @@ static void renderFrame(void)
 	F->params[3] = getenv("CTR_RTX_EXPERIMENT") ? (float)atof(getenv("CTR_RTX_EXPERIMENT")) : 0.0f; // 1: every ray opaque (wrong image: a timing bound)
 	uint32_t ndl = H->numDynLights > RTX_MAX_DYN_LIGHTS ? RTX_MAX_DYN_LIGHTS : H->numDynLights;
 	F->extra[0] = ndl;
-	F->extra[2] = H->lightMode;
-	F->extra[3] = R.spp;
+	F->extra[1] = R.remActive ? 1u : 0u;
+	F->extra[2] = hybrid ? 0u : 1u;
+	F->extra[3] = baked ? 1u : R.spp; // (baked mode: one sample, no rays to average)
 	F->params2[1] = 24.0f; // radiance cache cell size near the camera
 	// haze: density at the camera's height (outdoors ~90% clear over 10000 units),
 	// e-folding height; CTR_RTX_FOG_DENSITY scales it
@@ -4220,8 +4428,9 @@ static void renderFrame(void)
 	{
 		memcpy(&dp[i * 9], dyn[i].p, 36);
 	}
-	dynSmoothNormals(dyn, nd, R.dynNormalsStage.map, camPos);
+	dynSmoothNormals(dyn, nd, R.dynNormalsStage.map, (const float(*)[3])camPos, numViews);
 	uint32_t nc = H->numLevelCap > RTX_MAX_LEVEL_CAP ? RTX_MAX_LEVEL_CAP : H->numLevelCap;
+	nc = R.remActive ? 0u : nc; // (the texture layer is the PS1 level's)
 	const struct RtxDynTri *cap = (const void *)(R.shm + RTX_OFF_LEVEL_CAP);
 	memcpy(R.capTrisStage.map, cap, nc * sizeof(struct RtxDynTri));
 	float *cp = R.capPosStage.map;
@@ -4236,13 +4445,30 @@ static void renderFrame(void)
 		float rec[12] = {l->pos[0], l->pos[1], l->pos[2], 0.0f, l->color[0], l->color[1], l->color[2], l->falloff, l->size, 0, 0, 0};
 		memcpy(&ls[i * 12], rec, sizeof(rec));
 	}
+	// proxies' lights (a mine cart's headlamp), where their instance is
+	for (uint32_t i = 0; R.remActive && (i < R.remNumSlots); i++)
+	{
+		const float *M = &F->proxy[i][0][0], *l = R.remSlots[i].light;
+		if (((M[0] == 0.0f) && (M[1] == 0.0f) && (M[2] == 0.0f)) || (l[3] + l[4] + l[5] <= 0.0f))
+		{
+			continue;
+		}
+		float rec[12] = {0, 0, 0, 0.0f, l[3], l[4], l[5], l[6], l[7], 0, 0, 0};
+		for (int r = 0; r < 3; r++)
+		{
+			rec[r] = M[r * 4] * l[0] + M[r * 4 + 1] * l[1] + M[r * 4 + 2] * l[2] + M[r * 4 + 3];
+		}
+		memcpy(&ls[ndl * 12], rec, sizeof(rec));
+		ndl++;
+	}
+	F->extra[0] = ndl;
 
-	VkAccelerationStructureInstanceKHR inst[4];
+	VkAccelerationStructureInstanceKHR inst[TLAS_MAX_INST];
 	memset(inst, 0, sizeof(inst));
 	uint32_t numInst = 0;
 	for (int k = 0; k < 3; k++)
 	{
-		if (((k == 1) && (nd == 0)) || ((k == 2) && (nc == 0)))
+		if (((k == 0) && R.remActive) || ((k == 1) && (nd == 0)) || ((k == 2) && (nc == 0)))
 		{
 			continue;
 		}
@@ -4254,10 +4480,32 @@ static void renderFrame(void)
 	}
 	// the level again, forced opaque (mask 0x8): bounce rays take it, so the RT
 	// hardware settles their level hits without the shaders' per-candidate tests
-	inst[numInst] = inst[0];
-	inst[numInst].mask = 0x8;
-	inst[numInst].flags = VK_GEOMETRY_INSTANCE_FORCE_OPAQUE_BIT_KHR;
-	numInst++;
+	if (!R.remActive)
+	{
+		inst[numInst] = inst[0];
+		inst[numInst].mask = 0x8;
+		inst[numInst].flags = VK_GEOMETRY_INSTANCE_FORCE_OPAQUE_BIT_KHR;
+		numInst++;
+	}
+	// or the remaster mesh in its place: opaque materials (mask 0x10, every ray)
+	// and alpha tested ones (0x20: not bounce rays, see MASK_FAST)
+	// (opaque 0x10: every ray; alpha tested and grass 0x20: not bounce rays, see
+	// MASK_FAST; decals 0x40: only common.glsl remDecals looks for them)
+	// (animated nodes, proxies: 0x10 as opaque, their few alpha tested triangles checked)
+	static const uint8_t remMask[REM_GROUPS] = {0x10, 0x20, 0x20, 0x40, 0x10, 0x10};
+	for (int k = 0; R.remActive && (k < REM_GROUPS); k++)
+	{
+		if (!R.remBlas[k].as)
+		{
+			continue;
+		}
+		VkAccelerationStructureInstanceKHR *I = &inst[numInst++];
+		I->transform.matrix[0][0] = I->transform.matrix[1][1] = I->transform.matrix[2][2] = 1.0f;
+		I->instanceCustomIndex = REM_INST + (uint32_t)k;
+		I->mask = remMask[k];
+		I->flags = (k == REM_OPAQUE) ? VK_GEOMETRY_INSTANCE_FORCE_OPAQUE_BIT_KHR : 0;
+		I->accelerationStructureReference = R.remBlas[k].addr;
+	}
 
 	// the game's input is copied: pipelined, the game goes on with its next frame
 	__sync_synchronize();
@@ -4289,9 +4537,9 @@ static void renderFrame(void)
 	for (uint32_t i = 0; i < numInst; i++)
 	{
 		uint32_t k = inst[i].instanceCustomIndex;
-		if (k == 0)
+		if ((k == 0) || (k >= REM_INST))
 		{
-			continue;
+			continue; // (level / remaster: built once; the grass refit below)
 		}
 		Accel *blas = (k == 1) ? &R.dynBlas : &R.capBlas;
 		uint32_t count = (k == 1) ? nd : nc;
@@ -4304,6 +4552,9 @@ static void renderFrame(void)
 		        VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR | VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR);
 	}
 	memcpy(R.tlasInstances.map, inst, sizeof(inst));
+	vkCmdBindDescriptorSets(R.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, R.pipeLayout, 0, 1, &R.sets[R.parity][PASS_TRACE], 0, NULL);
+	vkCmdBindDescriptorSets(R.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, R.pipeLayout, 1, 1, &R.remSet, 0, NULL);
+	remWindUpdate();
 
 	{
 		VkAccelerationStructureGeometryKHR g = {VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR, .geometryType = VK_GEOMETRY_TYPE_INSTANCES_KHR};
@@ -4316,7 +4567,7 @@ static void renderFrame(void)
 		                                                   .dstAccelerationStructure = R.tlas.as,
 		                                                   .geometryCount = 1,
 		                                                   .pGeometries = &g};
-		uint32_t maxInst = 4;
+		uint32_t maxInst = TLAS_MAX_INST;
 		VkAccelerationStructureBuildSizesInfoKHR sizes = {VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR};
 		vkGetAccelerationStructureBuildSizesKHR(R.dev, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &bi, &maxInst, &sizes);
 		bi.scratchData.deviceAddress = scratchAddr(sizes.buildScratchSize);
@@ -4331,6 +4582,7 @@ static void renderFrame(void)
 	VkDescriptorSet *sets = R.sets[R.parity];
 	stamp(TS_BUILT);
 	vkCmdBindPipeline(R.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, R.pipeTrace);
+	vkCmdBindDescriptorSets(R.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, R.pipeLayout, 1, 1, &R.remSet, 0, NULL); // (kept by every pass)
 	vkCmdBindDescriptorSets(R.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, R.pipeLayout, 0, 1, &sets[PASS_TRACE], 0, NULL);
 	vkCmdDispatch(R.cmd, gx, gy, 1);
 	stamp(TS_TRACED);
