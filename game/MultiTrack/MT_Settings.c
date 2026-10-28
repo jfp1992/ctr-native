@@ -440,6 +440,17 @@ void MT_Settings_Tick(struct GameTracker *gGT)
 		s_mtSet.focus = MT_SET_NONE;
 		return;
 	}
+
+	// test harness: CTR_TEST_BAKE=1 runs "Bake now" once the main menu is up
+	static int s_testBake = -1;
+	if (s_testBake < 0)
+		s_testBake = getenv("CTR_TEST_BAKE") != NULL;
+	if ((s_testBake == 1) && Rtx_Supported() && !Rtx_BakeRunning())
+	{
+		s_testBake = 2;
+		Rtx_BakeStart();
+		s_mtSet.focus = MT_SET_BAKING; // (its progress shown: elsewhere a bake stops)
+	}
 	// (the cog: on the main menu's top level only, once its menu is up)
 	if ((s_mtSet.focus == MT_SET_NONE) && !MT_Settings_OnMainMenu())
 		return;
