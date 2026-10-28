@@ -189,7 +189,7 @@ static void MT_Settings_ValueText(int row, char *buf, int size)
 		break;
 	}
 	case MT_ROW_RTX:
-		snprintf(buf, size, "%s", !Rtx_Supported() ? "NOT SUPPORTED" : (Rtx_Enabled() ? "ON" : "OFF"));
+		snprintf(buf, size, "%s", !Rtx_Supported() ? "NOT SUPPORTED" : (Rtx_Enabled() ? "FULL" : "LIGHT"));
 		break;
 	case MT_ROW_SPP:
 		snprintf(buf, size, "%d", Rtx_GetSpp());

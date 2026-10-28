@@ -4285,6 +4285,8 @@ static void renderFrame(void)
 		remBakeRun();
 	}
 	baked = baked && R.remBaked;
+	// (ray tracing "off" on a PS1 level: the light mode)
+	int lite = H->settings.baked && !R.remActive;
 	uint32_t nd = H->numDynTris;
 	if (nd > RTX_MAX_DYN_TRIS)
 	{
@@ -4353,7 +4355,7 @@ static void renderFrame(void)
 	F->jitter[0] = halton(1u + R.frameIndex % 16u, 2u);
 	F->jitter[1] = halton(1u + R.frameIndex % 16u, 3u);
 	F->feat[0] = H->settings.texFilter;
-	F->feat[1] = H->settings.specular;
+	F->feat[1] = H->settings.baked ? 0u : H->settings.specular; // (no highlights in the light mode)
 	F->feat[2] = H->settings.fog;
 	F->rem[0] = R.remStart[REM_ALPHA];
 	F->rem[1] = R.remStart[REM_GRASS];
@@ -4363,7 +4365,7 @@ static void renderFrame(void)
 	{
 		nmFlip = getenv("CTR_RTX_NM_FLIPY") ? (atoi(getenv("CTR_RTX_NM_FLIPY")) != 0) : 0;
 	}
-	F->rem[3] = (R.remActive && R.remSkyView ? 1u : 0u) | (R.remDyn ? 2u : 0u) | (nmFlip ? 4u : 0u) | (R.remWind ? 8u : 0u) | (baked ? 16u : 0u);
+	F->rem[3] = (R.remActive && R.remSkyView ? 1u : 0u) | (R.remDyn ? 2u : 0u) | (nmFlip ? 4u : 0u) | (R.remWind ? 8u : 0u) | (baked ? 16u : 0u) | (lite ? 32u : 0u);
 	F->rem2[0] = R.remGrassVert;
 	F->rem2[1] = R.remNumVerts;
 	F->rem3[0] = R.remStart[REM_ANIM];
@@ -4419,7 +4421,7 @@ static void renderFrame(void)
 	F->extra[0] = ndl;
 	F->extra[1] = R.remActive ? 1u : 0u;
 	F->extra[2] = hybrid ? 0u : 1u;
-	F->extra[3] = baked ? 1u : R.spp; // (baked mode: one sample, no rays to average)
+	F->extra[3] = (baked || lite) ? 1u : R.spp; // (baked / light mode: one sample)
 	F->params2[1] = 24.0f; // radiance cache cell size near the camera
 	// haze: density at the camera's height (outdoors ~90% clear over 10000 units),
 	// e-folding height; CTR_RTX_FOG_DENSITY scales it

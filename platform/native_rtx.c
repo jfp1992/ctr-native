@@ -266,12 +266,13 @@ static struct RtxDynTri *Rtx_DynTris(void) { return (struct RtxDynTri *)(s_rtx.b
 
 static void Rtx_InitSettings(void);
 
-// the renderer draws: ray tracing on, or a Nitro-Fueled track with it off (its
-// baked look: the GL path has no NF mesh, only the host's PS1 level)
+// the renderer draws whenever it runs: ray tracing off is its light mode
+// (RtxSettings.baked: one sample, cached bounce light; a Nitro-Fueled track
+// lit from its bake), the GL path with baked vertex light is for GPUs without
+// ray tracing
 static int Rtx_Drawing(void)
 {
-	struct MTEntry *e = MT_ActiveEntry();
-	return s_rtx.enabled || ((e != NULL) && (e->flags & MT_FLAG_REMASTER));
+	return s_rtx.enabled || (s_rtx.rendererPid > 0);
 }
 
 // starts the renderer process on the shared memory (again after it died:
@@ -464,7 +465,7 @@ int Rtx_Enabled(void)
 void Rtx_SetEnabled(int on)
 {
 	s_rtx.enabled = on != 0;
-	printf("[RTX] ray tracing %s\n", s_rtx.enabled ? "on" : "off");
+	printf("[RTX] ray tracing %s\n", s_rtx.enabled ? "full" : "light (one sample, cached bounce light)");
 	Rtx_SaveSettings();
 }
 
@@ -494,7 +495,7 @@ const char *Rtx_KeyStatus(int scancode)
 	case SDL_SCANCODE_F6:
 		return s_rtxViewNames[s_rtx.debugView & 7];
 	case SDL_SCANCODE_F7:
-		return !Rtx_Supported() ? "not supported (no ray tracing GPU)" : (s_rtx.enabled ? (RTX_HDR->rendererReady ? "on" : "on (renderer not ready)") : "off");
+		return !Rtx_Supported() ? "not supported (no ray tracing GPU)" : (RTX_HDR->rendererReady ? (s_rtx.enabled ? "full" : "light") : "renderer not ready");
 	}
 	return "";
 }
