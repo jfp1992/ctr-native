@@ -1108,6 +1108,12 @@ internal void NativeGpu_FormatPointerRegion(char *dst, size_t dstSize, uintptr_t
 	snprintf(dst, dstSize, "unknown");
 }
 
+// polygons, lines, sprites (not state commands, fills, transfers)
+static int NativeGpu_IsDrawCode(int code)
+{
+	return (code >= 0x20) && (code < 0x80);
+}
+
 void ParsePrimitivesLinkedList(u32 *p, int singlePrimitive)
 {
 	if (!p)
@@ -1144,6 +1150,45 @@ void ParsePrimitivesLinkedList(u32 *p, int singlePrimitive)
 	}
 	else
 	{
+		// MultiTrack: ray traced frame. The sky goes in the farthest OT bucket,
+		// but whatever lands there after it (far models, particles) is drawn
+		// before it, and the traced image would go under the sky. So first the
+		// sky packets, with the state commands among them (draw area, offset),
+		// in order up to the last sky packet; the walk below skips those
+		u8 *lastSky = NULL;
+		if (Rtx_FrameActive() && Rtx_SkyPhase())
+		{
+			for (u8 *sp = (u8 *)p;; sp = nextPrim(sp))
+			{
+				const int len = getlen(sp);
+				lastSky = ((len > 0) && (len <= 32) && Rtx_IsSkyPacket((u32 *)sp)) ? sp : lastSky;
+				if (isendprim(sp) || !NativeGpu_IsValidOTLink((uintptr_t)nextPrim(sp)))
+				{
+					break;
+				}
+			}
+			for (u8 *sp = (u8 *)p; lastSky != NULL; sp = nextPrim(sp))
+			{
+				const int len = getlen(sp);
+				if ((len > 0) && (len <= 32) && (Rtx_IsSkyPacket((u32 *)sp) || !NativeGpu_IsDrawCode(getcode(sp))))
+				{
+					u8 *cur = sp, *end = sp + (len + P_LEN) * sizeof(u32);
+					cur += (ParsePrimitive((P_TAG *)cur) + P_LEN) * sizeof(u32);
+					while (cur < end)
+					{
+						cur += ParseTaglessPrimitive((u32 *)cur) * sizeof(u32);
+					}
+					GPUDrawSplit *skySplit = &s_gpu.splits[s_gpu.splitIndex];
+					skySplit->numVerts = s_gpu.vertexIndex - skySplit->startVertex;
+				}
+				if (sp == lastSky)
+				{
+					break;
+				}
+			}
+		}
+		int beforeLastSky = (lastSky != NULL);
+
 		// walk OT_TAG linked list
 		u8 *basePacket = (u8 *)p;
 		while (true)
@@ -1177,9 +1222,11 @@ void ParsePrimitivesLinkedList(u32 *p, int singlePrimitive)
 				{
 					const int rtxClass = Rtx_ClassifyPacket((u32 *)basePacket, tagLength);
 					const int code = getcode(basePacket);
-					if (rtxClass == RTX_PACKET_SKIP)
+					const int early = beforeLastSky && ((rtxClass == RTX_PACKET_SKY) || !NativeGpu_IsDrawCode(code));
+					beforeLastSky = beforeLastSky && (basePacket != lastSky);
+					if ((rtxClass == RTX_PACKET_SKIP) || early)
 					{
-						currentPacket = endPacket;
+						currentPacket = endPacket; // (traced; or drawn above, with the sky)
 					}
 					else if ((rtxClass != RTX_PACKET_SKY) && Rtx_SkyPhase() && (code >= 0x20) && (code < 0x80))
 					{

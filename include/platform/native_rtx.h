@@ -74,6 +74,7 @@ void Rtx_TrackPacket(u32 *packet);                    // every packet of the OT 
 float Rtx_VertexDepth(u32 xy);                         // view z for the overlay depth test, 0 = none
 int Rtx_SkipCommand(u32 *packet, u32 *cmd);            // partly captured packet: words to skip at cmd, 0 = draw
 int Rtx_SkyPhase(void);
+int Rtx_IsSkyPacket(u32 *packet); // skybox / glow / stars (no side effects)
 void Rtx_EndSkyPhase(void); // sky layer done: snapshot it, ray trace, blit under the overlay
 int Rtx_RenderFrame(int outW, int outH, const u8 **rgba, const float **depth); // pipelined: last request's image
 

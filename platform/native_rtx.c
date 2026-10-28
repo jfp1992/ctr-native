@@ -3230,6 +3230,12 @@ int Rtx_SkyPhase(void)
 	return s_rtx.skyPhase;
 }
 
+int Rtx_IsSkyPacket(u32 *packet)
+{
+	const struct RtxRange *r = Rtx_FindRange((u32)packet);
+	return (r != NULL) && (r->tag == RTX_TAG_SKY);
+}
+
 void Rtx_EndSkyPhase(void)
 {
 	s_rtx.skyPhase = 0;
