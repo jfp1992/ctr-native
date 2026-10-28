@@ -18,6 +18,13 @@ struct View
 	vec4 prevT;
 	vec4 proj;        // H, vpX, vpY, vpW
 	vec4 proj2;       // vpH, dispW, dispH, prevH
+	vec4 rect;        // the display pixels it owns: x0, y0, x1, y1 (PS1 display coords)
+	vec4 misc;        // near texture depth (view z, 0 none), 1: history reset (its camera cut), unused, unused
+};
+
+layout(set = 0, binding = 1, std430) readonly buffer FrameBuf
+{
+	View views[4];    // outSize.w of them
 	uvec4 size;       // outW, outH, frameIndex, debugView
 	vec4 sunDir;      // xyz towards sun, w cone (radians)
 	vec4 sunColor;    // rgb, w exposure
@@ -469,16 +476,111 @@ struct TriData
 	vec4 tint;    // level: the art's tint (fitArt), w glow
 	uint flags;
 	uint blend;   // 3 = opaque, else PS1 semi-transparency mode (0 avg, 1 add, 2 sub)
+	vec3 emit;    // remaster: emission (linear)
 };
 
 TriData fetchTriangle(uint inst, uint prim, vec2 bary)
 {
 	TriData d;
+	d.emit = vec3(0.0);
 	vec3 w = vec3(1.0 - bary.x - bary.y, bary.x, bary.y);
 	vec2 uv[3];
 	vec3 col[3];
 	uint clut = 0u, tpage = 0u;
 
+	if (inst >= INST_REM)
+	{
+		uint t = remTri(inst, prim);
+		uint v0 = remIdx[t * 3u], v1 = remIdx[t * 3u + 1u], v2 = remIdx[t * 3u + 2u];
+		d.p0 = remPos(v0);
+		d.p1 = remPos(v1);
+		d.p2 = remPos(v2);
+		d.n0 = remNormal(v0);
+		d.n1 = remNormal(v1);
+		d.n2 = remNormal(v2);
+		d.nSmooth = d.n0 * w.x + d.n1 * w.y + d.n2 * w.z;
+		vec2 t0 = remUv(v0), t1 = remUv(v1), t2 = remUv(v2);
+		vec4 c = remColor(v0) * w.x + remColor(v1) * w.y + remColor(v2) * w.z;
+		uint mi = remTriMat[t];
+		uvec4 m = remMats[mi * 3u], m1 = remMats[mi * 3u + 1u];
+		vec3 pos = d.p0 * w.x + d.p1 * w.y + d.p2 * w.z;
+		vec2 uv = t0 * w.x + t1 * w.y + t2 * w.z;
+		float lod = remLodBase(d.p0, d.p1, d.p2, t0, t1, t2, pos, g_texFilter);
+		float blend;
+		float dirMask = 1.0;
+		vec2 texMap = vec2(0.0);
+		if ((m.w & MAT_DIRBLEND) != 0u)
+		{
+			vec4 db = uintBitsToFloat(remMats[mi * 3u + 2u]);
+			dirMask = clamp(dot(normalize(d.nSmooth), db.xyz) + db.w, 0.0, 1.0);
+		}
+		else if ((m.w & MAT_BLEND_TEX) != 0u)
+		{
+			texMap = uintBitsToFloat(remMats[mi * 3u + 2u].xy);
+		}
+		float lod2 = lod;
+		vec2 uv2 = remUv2(m, mi, uv, lod2);
+		uv = remUv1(m, mi, uv, lod);
+		d.texel = vec4(remAlbedo(m, uv, uv2, c.a, dirMask, texMap, lod, lod2, blend).rgb, 1.0);
+		d.vcol = c.rgb;
+		if ((m.w & MAT_NORMAL) != 0u)
+		{
+			// normal map: tangent frame from the vertices', the layers' normals blended as their colours
+			vec4 ta = remTangent(v0), tb = remTangent(v1), tc = remTangent(v2);
+			vec3 n = normalize(d.nSmooth);
+			vec3 tg = ta.xyz * w.x + tb.xyz * w.y + tc.xyz * w.z;
+			tg = tg - n * dot(n, tg);
+			if (dot(tg, tg) > 1e-8)
+			{
+				tg = normalize(tg);
+				vec3 bt = cross(n, tg) * ta.w;
+				vec3 ts = remNormalSample(m1.x, uv, lod);
+				if (((m.w & MAT_BLEND2) != 0u) && (m1.y != 0xffffffffu))
+				{
+					ts = normalize(mix(ts, remNormalSample(m1.y, uv2, lod2), blend));
+				}
+				d.nSmooth = normalize(tg * ts.x + bt * ts.y + n * ts.z);
+			}
+		}
+		if ((m.w & MAT_EMIT_MASK) != 0u)
+		{
+			// glow mask (red of a composite) over the colour, per layer (lava)
+			bool second = ((m.w & MAT_EMIT_LAYER2) != 0u) && (m1.w == 0xffffffffu); // (the one mask is the second layer's)
+			float mask = second ? remSample(m.z, uv2, lod2).r : remSample(m.z, uv, lod).r;
+			bool running = second && ((m.w & MAT_UV_SCROLL2) != 0u);
+			mask = running ? max(mask, RUNNING_LIGHT_BASE) : mask;
+			if (((m.w & MAT_BLEND2) != 0u) && (m1.w != 0xffffffffu))
+			{
+				// (the second layer's own mask; scrolling: a running light, Drive-Thru Danger's floor)
+				float mask2 = remSample(m1.w, uv2, lod2).r;
+				mask = mix(mask, ((m.w & MAT_UV_SCROLL2) != 0u) ? max(mask2, RUNNING_LIGHT_BASE) : mask2, blend);
+			}
+			else if (second)
+			{
+				mask *= blend; // (Oxide Station's floor lights: not over the floor itself)
+			}
+			else if ((m.w & MAT_EMIT_LAYER1) != 0u)
+			{
+				mask *= 1.0 - blend;
+			}
+			// (a second layer's own mask: its own colour, not where the first shows through)
+			vec3 glow = running ? remRunningLight(m, remSample(m.y, uv2, lod2), uv2, lod2) : second ? remSample(m.y, uv2, lod2).rgb : d.texel.rgb;
+			d.emit = srgbToLinear(glow) * mask * 8.0; // (nf_level.py EMIT_MASK_GAIN)
+		}
+		else if ((m.w & MAT_EMIT_ALBEDO) != 0u)
+		{
+			d.emit = srgbToLinear(d.texel.rgb) * srgbToLinear(c.rgb) * remSample(m.z, uv, lod).r; // (colour x vertex colour: nf_level.py emission_mean)
+		}
+		else if ((m.w & MAT_EMIT) != 0u)
+		{
+			d.emit = srgbToLinear(remSample(m.z, uv, lod).rgb) * 2.0;
+		}
+		d.tint = vec4(1.0, 1.0, 1.0, 0.0);
+		d.flags = TRI_TEXTURED | (((m.w & MAT_WATER) != 0u) ? TRI_WATER : 0u) | (((m.w & MAT_UNLIT) != 0u) ? TRI_EMISSIVE : 0u) |
+				  (((m.w & MAT_GRASS) != 0u) ? TRI_DOUBLE_SIDED : 0u) | (((m.w & MAT_ICE) != 0u) ? TRI_ICE : 0u) | (((m.w & MAT_GLASS) != 0u) ? TRI_GLASS : 0u);
+		d.blend = ((m.w & (MAT_WATER | MAT_GLASS)) != 0u) ? 0u : 3u;
+		return d;
+	}
 	if (inst == INST_LEVEL)
 	{
 		uint w0 = levelTris[prim * 3u], w1 = levelTris[prim * 3u + 1u], w2 = levelTris[prim * 3u + 2u];
@@ -568,6 +670,10 @@ TriData fetchTriangle(uint inst, uint prim, vec2 bary)
 		{
 			d.texel = psxTexel(tpage, clut, int(floor(t.x)), int(floor(t.y)));
 		}
+		if ((d.blend != 3u) && ((d.flags & TRI_WATER) == 0u) && !psxTexelSemi(tpage, clut, int(floor(t.x)), int(floor(t.y))))
+		{
+			d.blend = 3u; // (this texel draws opaque)
+		}
 	}
 	else
 	{
@@ -581,6 +687,10 @@ TriData fetchTriangle(uint inst, uint prim, vec2 bary)
 // (lean: runs for every triangle a ray meets, so it reads only what it needs)
 bool candidateAccept(uint inst, uint prim, vec2 bary, bool includeSemi)
 {
+	if (inst >= INST_REM)
+	{
+		return (inst == INST_REM) || remAccept(inst, prim, bary, includeSemi);
+	}
 	uint flags, blend, tpage = 0u, clut = 0u;
 	vec2 t = vec2(0.0);
 	vec3 w = vec3(1.0 - bary.x - bary.y, bary.x, bary.y);
@@ -627,9 +737,14 @@ bool candidateAccept(uint inst, uint prim, vec2 bary, bool includeSemi)
 			}
 		}
 	}
-	if (((flags & TRI_SMOKE) != 0u) || (!includeSemi && (blend != 3u)))
+	if ((flags & TRI_SMOKE) != 0u)
 	{
 		return false; // smoke is drawn by GL and only shades (smokeBlocks)
+	}
+	if (!includeSemi && (blend != 3u) &&
+	    (((flags & (TRI_TEXTURED | TRI_WATER)) != TRI_TEXTURED) || psxTexelSemi(tpage, clut, int(floor(t.x)), int(floor(t.y)))))
+	{
+		return false; // see-through texels (and water, untextured glows): camera rays only
 	}
 	// colour key
 	return ((flags & TRI_TEXTURED) == 0u) || (psxTexel(tpage, clut, int(floor(t.x)), int(floor(t.y))).a >= 0.5);
@@ -680,6 +795,10 @@ vec3 triFaceNormal(uint inst, uint prim)
 
 bool tieWins(uint inst, uint candPrim, float candT, uint comInst, uint comPrim, float comT)
 {
+	if ((inst >= INST_REM) || (comInst >= INST_REM))
+	{
+		return candT < comT; // (remaster decals are lifted off their surface: no ties)
+	}
 	float eps = 0.02 + 1e-3 * comT;
 	// decals a little off the surface they sit on (boosters, road markings):
 	// parallel and a few units apart along the ray, the PS1 draws them over it
@@ -773,6 +892,33 @@ float boosterMargin(float t)
 	return 8.0 + 0.01 * t;
 }
 
+// the level polygon's draw mode from its texture page: 3 = opaque
+uint levelTriBlend(uint prim)
+{
+	uint w1 = levelTris[prim * 3u + 1u], w2 = levelTris[prim * 3u + 2u];
+	uint slot = w1 >> 16;
+	if ((((w2 >> 24) & TRI_TEXTURED) == 0u) || (slot == 0xffffu))
+	{
+		return 3u;
+	}
+	return (texSlots[slot * 3u + 2u] >> 21) & 3u;
+}
+
+// a see-through level polygon (light layer) lying on the surface a ray leaves
+// from, within the layers' distance of it (trace.comp decalMargin: the hubs'
+// tunnel walls carry one 4-35 units off): it doesn't shade or bounce that
+// surface's light (its opaque texels would, texel by texel: a shading that
+// flickers as the camera moves). Shadow and bounce rays only
+bool g_skipLayers = false;
+bool layerOccluder(uint ci, uint cp, vec3 o)
+{
+	if (!g_skipLayers || (ci != INST_LEVEL) || (levelTriBlend(cp) == 3u))
+	{
+		return false;
+	}
+	return abs(dot(o - levelPos(levelTris[cp * 3u] & 0xffffu), triFaceNormal(INST_LEVEL, cp))) < 40.0;
+}
+
 // closest hit; returns t < 0 on miss
 float traceClosest(vec3 o, vec3 d, float tmax, bool includeSemi, out uint inst, out uint prim, out vec2 bary)
 {
@@ -784,7 +930,7 @@ float traceClosest(vec3 o, vec3 d, float tmax, bool includeSemi, out uint inst, 
 		{
 			uint ci = uint(rayQueryGetIntersectionInstanceCustomIndexEXT(rq, false));
 			uint cp = uint(rayQueryGetIntersectionPrimitiveIndexEXT(rq, false));
-			if (candidateBeats(rq, ci, cp) && candidateAccept(ci, cp, rayQueryGetIntersectionBarycentricsEXT(rq, false), includeSemi))
+			if (!layerOccluder(ci, cp, o) && candidateBeats(rq, ci, cp) && candidateAccept(ci, cp, rayQueryGetIntersectionBarycentricsEXT(rq, false), includeSemi))
 			{
 				rayQueryConfirmIntersectionEXT(rq);
 			}
@@ -874,7 +1020,7 @@ bool occludedMask(vec3 o, vec3 d, float tmax, uint mask)
 			uint ci = uint(rayQueryGetIntersectionInstanceCustomIndexEXT(rq, false));
 			uint cp = uint(rayQueryGetIntersectionPrimitiveIndexEXT(rq, false));
 			vec2 cb = rayQueryGetIntersectionBarycentricsEXT(rq, false);
-			if (g_cullBack && (ci == INST_LEVEL) && levelBackFacing(cp, d))
+			if ((g_cullBack && (ci == INST_LEVEL) && levelBackFacing(cp, d)) || layerOccluder(ci, cp, o))
 			{
 				continue;
 			}
@@ -892,10 +1038,16 @@ bool occludedMask(vec3 o, vec3 d, float tmax, uint mask)
 bool occluded(vec3 o, vec3 d, float tmax) { return occludedMask(o, d, tmax, MASK_SCENE); }
 
 // a texture layer polygon's texel at bary is drawn (not colour keyed) and it is
-// see-through as asked (lean: reads only what it needs, as candidateAccept)
+// see-through as asked (lean: reads only what it needs, as candidateAccept).
+// Split screen: only the polygons this pixel's view drew (every view draws the
+// level its own way: LOD, textures)
 bool capturedTexelShows(uint prim, vec2 bary, bool semi)
 {
 	uint flags = capTris[prim * 16u + 14u] >> 16;
+	if ((flags >> TRI_VIEW_SHIFT) != uint(g_view))
+	{
+		return false;
+	}
 	uint clut = capTris[prim * 16u + 10u] >> 16, tpage = capTris[prim * 16u + 11u] & 0xffffu;
 	uint blend = ((flags & TRI_SEMI) != 0u) ? ((tpage >> 5) & 3u) : 3u;
 	if (semi != (blend != 3u))
@@ -924,8 +1076,14 @@ bool traceCaptured(vec3 o, vec3 d, float t, float eps, bool semi, out uint prim,
 	{
 		return true;
 	}
+	// the PS1 paints, no depth buffer: of its polygons around the hit, the one
+	// it drew last shows (a light layer over a tunnel wall, up to ~35 units
+	// off it, either side). Every one in the window is looked at (none is
+	// committed: the RT hardware would skip what lies past it); texture layer
+	// polygons are numbered in drawing order
 	prim = 0u;
 	bary = vec2(0.0);
+	bool found = false;
 	rayQueryEXT rq;
 	rayQueryInitializeEXT(rq, tlas, gl_RayFlagsNoneEXT, 0x4u, o, max(t - eps, 0.0), d, t + eps);
 	while (rayQueryProceedEXT(rq))
@@ -933,19 +1091,16 @@ bool traceCaptured(vec3 o, vec3 d, float t, float eps, bool semi, out uint prim,
 		if (rayQueryGetIntersectionTypeEXT(rq, false) == gl_RayQueryCandidateIntersectionTriangleEXT)
 		{
 			uint cp = uint(rayQueryGetIntersectionPrimitiveIndexEXT(rq, false));
-			if (capturedTexelShows(cp, rayQueryGetIntersectionBarycentricsEXT(rq, false), semi) && candidateBeats(rq, INST_CAP, cp))
+			vec2 cb = rayQueryGetIntersectionBarycentricsEXT(rq, false);
+			if ((!found || (cp > prim)) && capturedTexelShows(cp, cb, semi))
 			{
-				rayQueryConfirmIntersectionEXT(rq);
+				found = true;
+				prim = cp;
+				bary = cb;
 			}
 		}
 	}
-	if (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionTriangleEXT)
-	{
-		return false;
-	}
-	prim = uint(rayQueryGetIntersectionPrimitiveIndexEXT(rq, true));
-	bary = rayQueryGetIntersectionBarycentricsEXT(rq, true);
-	return true;
+	return found;
 }
 
 struct Surface
@@ -961,6 +1116,7 @@ struct Surface
 	uint blend;
 	bool dynamic;
 	vec4 tint; // level: the art's tint, w glow
+	vec3 emission; // remaster: emission maps (linear)
 };
 
 vec3 srgbToLinear(vec3 c) { return pow(max(c, vec3(0.0)), vec3(2.2)); }
@@ -1008,6 +1164,17 @@ Surface surfaceAt(uint inst, uint prim, vec2 bary, vec3 rayDir)
 // what the texture and vertex colour make of a surface (also from the texture layer)
 void surfaceMaterial(inout Surface s, TriData d, uint inst)
 {
+	s.emission = d.emit;
+	if (inst >= INST_REM)
+	{
+		// remaster: texture x vertex colour (ambient occlusion, tints; grass
+		// keeps its wind weights there and is white); always fully relit. Unlit
+		// materials show as drawn (ps1Light 1: their emission)
+		s.albedo = min(srgbToLinear(d.texel.rgb) * srgbToLinear(d.vcol), vec3(0.95));
+		s.ps1Color = d.texel.rgb * d.vcol;
+		s.ps1Light = vec3(1.0);
+		return;
+	}
 	// PS1 modulation is texel * vertex colour / 0x80. Vertex colours are the
 	// artists' light (level) or the GTE's (models): the albedo is the texel, the
 	// light is traced.
@@ -1175,6 +1342,11 @@ vec3 skyRadiance(vec3 d)
 	{
 		return F.ambient.rgb;
 	}
+	if (((F.rem.w & 1u) != 0u) && (F.wind.z > 0.0))
+	{
+		// Nitro-Fueled skybox, as bright as the fitted sky light (levelPrep)
+		return srgbToLinear(textureLod(remSky, d, 0.0).rgb) * F.wind.z * ((d.y < 0.0) ? 0.5 : 1.0);
+	}
 	if (F.gridDim.w != 0u)
 	{
 		// the level's own sky colours (already linear and scaled), bilinear
@@ -1216,7 +1388,7 @@ float surfaceEps(vec3 p, bool dynamic)
 // (foldOccluder, the same switch: g_skipFold)
 bool facesLight(vec3 ng, vec3 dir)
 {
-	return g_skipFold || (dot(ng, dir) > 0.0);
+	return (g_skipFold && !g_remSurf) || (dot(ng, dir) > 0.0);
 }
 
 vec3 rayOrigin(vec3 p, vec3 n, vec3 ng, vec3 dir, float eps)
@@ -1244,6 +1416,11 @@ float lightFalloff(float d2, float f)
 
 // one shadowed sample from lights[first, first+count): 16 candidates picked by
 // their unshadowed contribution (resampled importance sampling), one shadow ray
+// set for a model's emitter light: a light right at it (its own turbo flame,
+// exhaust glow) gives it little, or it would rim the kart bright; others (warp
+// pads, torches, other karts' flames) light it fully
+bool g_modelEmit = false;
+
 vec3 sampleLightSet(uint first, uint count, vec3 p, vec3 n, vec3 ng, float eps, inout uint rng)
 {
 	if (count == 0u)
@@ -1284,6 +1461,7 @@ vec3 sampleLightSet(uint first, uint count, vec3 p, vec3 n, vec3 ng, float eps, 
 		return vec3(0.0);
 	}
 	vec3 f = l1.rgb * ndl * lightFalloff(dist * dist, l1.w);
+	f *= g_modelEmit ? clamp((dist - 80.0) / 220.0, 0.2, 1.0) : 1.0;
 	// RIS estimate f/p_hat * mean(p_hat); the caller multiplies by count (uniform source pdf 1/count)
 	return f / chosenW * (wsum / float(M));
 }
@@ -1459,7 +1637,7 @@ vec3 lightSampleAll(vec3 p, vec3 n, vec3 ng, bool dynamic, inout uint rng)
 {
 	vec3 result = vec3(0.0);
 	float eps = rayEps(p);
-	g_skipFold = !dynamic;
+	g_skipFold = !dynamic && !g_remSurf;
 	g_foldN = ng;
 	if (F.extra.z == 0u)
 	{
@@ -1496,7 +1674,7 @@ vec3 lightSampleAll(vec3 p, vec3 n, vec3 ng, bool dynamic, inout uint rng)
 void cacheCell(vec3 p, vec3 n, vec4 jitter, out uint slot, out uint key)
 {
 	float base = F.params2.y;
-	float dist = length(p - F.camPos.xyz);
+	float dist = nearestCamDist(p);
 	float lf = log2(max(dist * 0.015 / base, 1.0));
 	int level = clamp(int(floor(lf + jitter.w - 0.5)), 0, 12);
 	float size = base * exp2(float(level));

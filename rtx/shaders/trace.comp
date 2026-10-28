@@ -65,7 +65,8 @@ vec3 shadeSecondary(vec3 o, vec3 d, float tmax, bool fast, inout uint rng)
 			// models (karts, characters) only by what lights them directly: their
 			// undersides are dark, which is what grounds them (contact shadows)
 			vec3 indirect = s.dynamic ? vec3(0.0) : cacheLookup(s.pos, s.normal, indirectFallback(), rng);
-			result = s.albedo * (lightSample(s.shadowPos, s.normal, s.geoNormal, s.dynamic, rng) + indirect);
+			g_remSurf = inst >= INST_REM;
+			result = s.albedo * (lightSample(s.shadowPos, s.normal, s.geoNormal, s.dynamic, rng) + indirect) + s.emission / max(F.sunColor.w, 1e-3);
 		}
 	}
 	g_fastRays = false;
@@ -191,7 +192,7 @@ vec3 dynLightSamples(vec3 p, vec3 n, vec3 ng, bool dynamic, uint count, inout ui
 	vec3 sum = vec3(0.0);
 	for (uint i = 0u; i < count; i++)
 	{
-		g_skipFold = !dynamic; // (as lightSample: the floor continuing casts no shadow)
+		g_skipFold = !dynamic && !g_remSurf; // (as lightSample: the floor continuing casts no shadow)
 		g_foldN = ng;
 		sum += dynLightSample(p, n, ng, rng);
 	}
@@ -689,15 +690,20 @@ void main()
 			lastRes = vec4(uintBitsToFloat(res), W, m, 0.0);
 		}
 		g_lightBlocked = false;
+		g_remSurf = inst >= INST_REM; // (a bounce below may have changed it)
 		g_useBn = true;
 		g_specOn = specular;
 		g_bnSun = blueNoise2(px, si, 1u);
-		vec3 direct = lightSample(pl, n, ng, sf.dynamic, rng);
+		// (baked mode: the remaster's light as rembake.comp left it, no rays)
+		bool bakedHit = ((F.rem.w & 16u) != 0u) && (inst >= INST_REM) && !sf.dynamic;
+		vec3 direct = bakedHit ? remBakedAt(inst, prim, bary) : lightSample(pl, n, ng, sf.dynamic, rng);
 		g_useBn = false;
 		g_specOn = false;
 		// a pick whose light is blocked here isn't carried on (visibility reuse)
 		lastRes.y = g_lightBlocked ? 0.0 : lastRes.y;
-		dynLight += dynLightSamples(pl, n, ng, sf.dynamic, max((DYN_SAMPLES + spp - 1u) / spp, 1u), rng);
+		g_modelEmit = sf.dynamic;
+		dynLight += bakedHit ? vec3(0.0) : dynLightSamples(pl, n, ng, sf.dynamic, max((DYN_SAMPLES + spp - 1u) / spp, 1u), rng);
+		g_modelEmit = false;
 		if (F.extra.z == 0u)
 		{
 			// hybrid: the track's own (PS1 vertex colour) lighting, darkened where a
@@ -723,17 +729,34 @@ void main()
 			}
 			float aoRadius = (F.ambient.w > 0.5) ? F.params.x : 1e8;
 			// (indoors a bounce that gets past the AO radius sees the ambient: skyRadiance)
-			vec3 indirect = (abs(F.params.w - 4.0) < 0.5) ? vec3(0.0) : shadeSecondary(p + ng * eps, bd, aoRadius, true, rng); // experiment 4: no bounce (timing)
+			vec3 indirect = (bakedHit || (abs(F.params.w - 4.0) < 0.5)) ? vec3(0.0) : shadeSecondary(p + ng * eps, bd, aoRadius, true, rng); // experiment 4: no bounce (timing)
 			lighting += direct + indirect;
 			indirectSum += indirect;
 		}
 	}
 	g_resMode = 0u;
 	resCur[idx] = lastRes;
+	// diagnostics (CTR_RTX_DEBUG "static light"): how much the level's lamps and
+	// glows give models against the level, one pixel in 64
+	if (((px.x & 7u) == 0u) && ((px.y & 7u) == 0u) && (inst < INST_REM))
+	{
+		uint so, sc;
+		vec3 st = sampleStaticLights(pl, n, ng, rayEps(p), rng);
+		uint base = sf.dynamic ? 180u : 188u;
+		atomicAdd(lumSums[base], 1u);
+		atomicAdd(lumSums[base + 1u], uint(min(luma(st) * exposure, 64.0) * 1024.0));
+		atomicAdd(lumSums[base + 2u], staticLightCell(pl, so, sc) ? sc : 0u);
+		atomicAdd(lumSums[base + 3u], uint(min(luma(sf.tint.rgb), 64.0) * 1024.0));
+		atomicAdd(lumSums[base + 4u], uint(min(luma(lighting / float(spp)) * exposure, 64.0) * 1024.0));
+		atomicAdd(lumSums[base + 5u], uint(min(luma(dynLight / float(spp)) * exposure, 64.0) * 1024.0));
+		atomicAdd(lumSums[base + 6u], uint(min(luma(sf.albedo), 64.0) * 1024.0));
+		// shown brightness, linear: the PS1's, and as traced (albedo x light x exposure)
+		atomicAdd(lumSums[base + 7u], uint(min(luma(srgbToLinear(clamp(sf.ps1Color, 0.0, 1.0))), 64.0) * 1024.0));
+		atomicAdd(lumSums[base + 24u], uint(min(luma(sf.albedo * (lighting + dynLight) / float(spp)) * exposure, 64.0) * 1024.0));
+	}
 	lighting /= float(spp);
-	// models take only a little emitter light: a kart's own turbo flame sits right
-	// against it and would rim it bright (the level gets it all, the kart's shadow too)
-	dynLight /= float(spp) * (sf.dynamic ? 3.0 : 1.0);
+	// (models: little of the emitters right at them, g_modelEmit)
+	dynLight /= float(spp);
 	if (g_touchedDyn && !sf.dynamic && (inst == INST_LEVEL))
 	{
 		atomicAdd(lumSums[7], 1u); // diagnostics: level pixels whose rays met a model (its shadow, its bounce)
@@ -788,8 +811,9 @@ void main()
 	{
 		// diagnostics: 6 sun x shadow, 7 sun without shadow (smooth normal)
 		float ndl = max(dot(n, F.sunDir.xyz), 0.0);
-		g_skipFold = !sf.dynamic;
+		g_skipFold = !sf.dynamic && (inst < INST_REM);
 		g_foldN = ng;
+		g_remSurf = inst >= INST_REM;
 		bool vis = (F.size.w == 7u) || ((ndl > 0.0) && !shadowRay(pl, n, ng, F.sunDir.xyz, 1e7, rayEps(p)));
 		g_skipFold = false;
 		lighting = vec3(vis ? ndl : 0.0);

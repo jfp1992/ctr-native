@@ -27,7 +27,7 @@
 
 #define RTX_SHM_NAME "/ctr_rtx"
 #define RTX_MAGIC    0x58545243u // 'CRTX'
-#define RTX_VERSION  8u
+#define RTX_VERSION  15u
 
 #define RTX_MAX_LEVEL_VERTS 65536u
 #define RTX_MAX_LEVEL_TRIS  (1u << 19)
@@ -54,10 +54,11 @@ enum RtxTriFlags
 	RTX_TRI_WATER = 4,        // reflective
 	RTX_TRI_EMISSIVE = 8,     // unlit (vertex colour x texel shown as is)
 	RTX_TRI_ANIMATED = 16,    // animated texture (AnimTex: boosters, lava, flames, screens)
-	RTX_TRI_GLOSSY = 32,      // terrain icy road, metal: glossy reflections
+	RTX_TRI_GLOSSY = 32,      // terrain icy road, metal, river asphalt (shallow water): glossy reflections
 	RTX_TRI_ICE = 64,         // terrain ice (and, renderer side, see-through bluish glass on icy levels): 90% mirror
 	RTX_TRI_SEMI = 128,       // captured polygon drawn semi-transparent (blend from its tpage)
 	RTX_TRI_SMOKE = 256,      // a smoke particle (camera-facing quad): only shadows, partly
+	RTX_TRI_VIEW_SHIFT = 14,  // captured level polygons: the view (split screen player) whose camera drew them, 2 bits
 	// water samples its texture slot (the level's water env map) by world position
 	// level triangles are semi-transparent when their texture's blend bits are
 	// not 3 (overlay 226 draws those with code 0x3e), water always
@@ -232,6 +233,7 @@ _Static_assert(sizeof(struct RtxLevelTri) == 12, "RtxLevelTri layout");
 _Static_assert(sizeof(struct RtxTexSlot) == 12, "RtxTexSlot layout");
 _Static_assert(sizeof(struct RtxDynTri) == 64, "RtxDynTri layout");
 _Static_assert(sizeof(struct RtxPointLight) == 48, "RtxPointLight layout");
+_Static_assert(sizeof(struct RtxProxyInst) == 64, "RtxProxyInst layout");
 
 // byte offsets of each section in the shared mapping
 #define RTX_ALIGN(x)          (((x) + 4095u) & ~4095u)
