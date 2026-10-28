@@ -253,6 +253,7 @@ static struct
 	float budgetMs;
 	double statPass[RTX_PASS_COUNT]; // debug: pass time sums since the last report
 	double cpuMs;                    // this frame's renderer CPU time so far
+	uint32_t probeSeen;              // last RtxHeader.probe answered (Ctrl+F6)
 } R;
 
 // timestamps written between the passes of a frame
@@ -3118,6 +3119,92 @@ static float halton(uint32_t i, uint32_t b)
 	return r;
 }
 
+// Ctrl+F6: trace.comp's probe pixels (lumSums 256+, 16 words each) appended to
+// rtx_probe.txt next to the executable, after the game's part of the frame
+static void writeProbe(const uint32_t *lum, uint32_t nd)
+{
+	char path[1100];
+	snprintf(path, sizeof(path), "%s/rtx_probe.txt", s_exeDir);
+	FILE *f = fopen(path, "a");
+	if (f == NULL)
+	{
+		logf_("probe: cannot write %s", path);
+		return;
+	}
+	static const char *groups[] = {"opaque", "alpha/glass", "grass", "decal", "animated", "proxy"};
+	const struct RtxDynTri *dyn = R.dynTrisStage.map;
+	fprintf(f, "renderer: traced %ux%u, %u models' triangles, remaster %s; columns at 1/4, 1/2, 3/4 across, rows down the lower 3/4\n", R.inW, R.inH, nd,
+	        R.remActive ? "on" : "off");
+	fprintf(f, "  pixel      | camera hit (after layers)            t | material | albedo luma (decals) | layer a | sun blocked by           | light | first hit\n");
+	for (int r = 0; r < 72; r++)
+	{
+		const uint32_t *w = &lum[256 + r * 16];
+		if (w[15] != 1u)
+		{
+			continue;
+		}
+		char hit[64], occ[64], first[24];
+		float t, ot, a0, a1, la, light;
+		memcpy(&t, &w[3], 4);
+		memcpy(&a0, &w[5], 4);
+		memcpy(&a1, &w[6], 4);
+		memcpy(&la, &w[8], 4);
+		memcpy(&ot, &w[11], 4);
+		memcpy(&light, &w[12], 4);
+		uint32_t kinds[2] = {w[1], w[9]};
+		uint32_t prims[2] = {w[2], w[10]};
+		char *out[2] = {hit, occ};
+		for (int k = 0; k < 2; k++)
+		{
+			uint32_t i = kinds[k], pr = prims[k];
+			if (i == 0xffffffffu)
+			{
+				snprintf(out[k], 64, "nothing");
+			}
+			else if (i == 0xfffffffeu)
+			{
+				snprintf(out[k], 64, "(faces away)");
+			}
+			else if ((i >= REM_INST) && (i < REM_INST + REM_GROUPS))
+			{
+				snprintf(out[k], 64, "remaster %s #%u", groups[i - REM_INST], pr);
+			}
+			else if ((i == 1u) && (pr < nd))
+			{
+				// a model: the instance it came from and its size
+				const struct RtxDynTri *d = &dyn[pr];
+				float e = 0.0f;
+				for (int a = 0; a < 3; a++)
+				{
+					for (int c = 0; c < 3; c++)
+					{
+						e = fmaxf(e, fabsf(d->p[a][c] - d->p[(a + 1) % 3][c]));
+					}
+				}
+				snprintf(out[k], 64, "model obj %u tri #%u size %.0f", d->object, pr, e);
+			}
+			else
+			{
+				snprintf(out[k], 64, "%s #%u", (i == 0u) ? "level" : (i == 2u) ? "texture layer" : "inst?", pr);
+			}
+		}
+		snprintf(first, sizeof(first), "%s", (w[13] == 0xffffffffu) ? "nothing" : (w[13] >= REM_INST) ? "remaster" : (w[13] == 1u) ? "model" : "level");
+		if (w[1] == 0xffffffffu)
+		{
+			fprintf(f, "  %c %4u,%4u | %-36s | first %s\n", "LCR"[r / 24], w[0] & 0xffffu, w[0] >> 16, hit, first);
+			continue;
+		}
+		char mat[16];
+		snprintf(mat, sizeof(mat), (w[4] == 0xffffffffu) ? "-" : "%u", w[4]);
+		char occT[16];
+		snprintf(occT, sizeof(occT), (w[9] >= 0xfffffffeu) ? "" : " t %.0f", ot);
+		fprintf(f, "  %c %4u,%4u | %-30s %6.0f | %8s | %.3f -> %.3f (%u) | %7.2f | %-24s%s | %5.3f | %s\n", "LCR"[r / 24], w[0] & 0xffffu, w[0] >> 16, hit, t, mat, a0, a1,
+		        w[7], la, occ, occT, light, first);
+	}
+	fclose(f);
+	logf_("probe written to %s", path);
+}
+
 static void renderFrame(void)
 {
 	double tStart = nowMs();
@@ -3243,10 +3330,12 @@ static void renderFrame(void)
 	}
 	F->params2[0] = (L->indoor ? 0.6e-5f : 1.0e-5f) * fogScale;
 	F->params2[2] = 2000.0f;
-	F->params2[3] = H->texNearDepth;
 	F->extra2[0] = R.cornerBase;
 	F->extra2[1] = CACHE_ENTRIES;
 	F->extra2[2] = 0;
+	int probe = (H->probe != R.probeSeen); // (trace.comp records its probe pixels this frame)
+	R.probeSeen = H->probe;
+	F->extra2[3] = probe ? 1u : 0u;
 	for (int i = 0; i < 4; i++)
 	{
 		F->gridMin[i] = R.gridMin[i];
@@ -3444,16 +3533,79 @@ static void renderFrame(void)
 
 	// exposure that makes the traced frame as bright as the PS1 one (smoothed)
 	const uint32_t *lum = R.lum.map;
+	if (probe)
+	{
+		writeProbe(lum, nd);
+	}
+	// models as bright against the level as on the PS1: the sampled model and
+	// level pixels' shown brightness, PS1 against traced (trace.comp; 180+ models,
+	// 188+ level: count, ..., +7 PS1, +24 traced), smoothed over the frames. The
+	// PS1 lights its models with the GTE, tuned per level (bright in the igloos);
+	// the traced light keeps their colour but not that tuning
+	if (!hybrid && (lum[180] >= 16) && (lum[188] >= 64) && (lum[180 + 24] > 0) && (lum[188 + 24] > 0) && (lum[188 + 7] > 0))
+	{
+		double ratioModel = (double)lum[180 + 7] / lum[180 + 24], ratioLevel = (double)lum[188 + 7] / lum[188 + 24];
+		float target = (float)fmin(fmax(ratioModel / ratioLevel, 0.5), 4.0);
+		R.modelGain = (R.modelGain > 0.0f) ? R.modelGain + (target - R.modelGain) * 0.03f : target;
+	}
 	if (!hybrid && (lum[2] > 64) && (lum[1] > 0))
 	{
 		float target = fminf(fmaxf((float)lum[0] / (float)lum[1], 0.1f), 16.0f);
 		R.autoExposure = (R.autoExposure > 0.0f) ? R.autoExposure + (target - R.autoExposure) * 0.05f : target;
 		if (getenv("CTR_RTX_DEBUG") && (R.frameIndex % 300 == 0))
 		{
+			logf_("model brightness gain %.2f", R.modelGain);
 			logf_("exposure %.2f (PS1 frame %.3f, traced %.3f), %u spp, %u static + %u frame lights, %u level polygons drawn", R.autoExposure,
 			      lum[0] / 1024.0 / lum[2], lum[1] / 1024.0 / lum[2], R.spp, R.numLights, ndl, nc);
 
 			logf_("texture layer: %u of %u level pixels; level mesh texels differ from the PS1's on %u; %u level pixels touched by models", lum[4], lum[3], lum[5], lum[7]);
+			for (int m = 0; m < 2; m++)
+			{
+				const uint32_t *st = &lum[m ? 188 : 180];
+				if (st[0])
+				{
+					logf_("static light on %s pixels: %u sampled, mean %.3f (x exposure), %.1f lights in their cells, tint luma %.2f; all light %.3f, "
+					      "emitters %.3f, albedo %.2f; shown (linear) PS1 %.3f, traced %.3f",
+					      m ? "level" : "model", st[0], st[1] / 1024.0 / st[0], (double)st[2] / st[0], st[3] / 1024.0 / st[0], st[4] / 1024.0 / st[0],
+					      st[5] / 1024.0 / st[0], st[6] / 1024.0 / st[0], st[7] / 1024.0 / st[0], st[24] / 1024.0 / st[0]);
+				}
+			}
+			logf_("sky leaks: %u sky pixels sampled; %u behind a see-through level texel (the PS1's polygon there: %u opaque, %u see-through), %u in cracks "
+			      "of the level mesh",
+			      lum[100], lum[101], lum[120], lum[121], lum[102]);
+			logf_("  the PS1 drew a polygon on %u of the sky pixels, %u of them opaque there (holes only the ray tracer has)", lum[140], lum[141]);
+			for (uint32_t k = 0; (k < lum[142]) && (k < 4); k++)
+			{
+				float hp[3];
+				memcpy(hp, &lum[143 + k * 3], 12);
+				float tc, pt, ta;
+				memcpy(&tc, &lum[160 + k * 4], 4);
+				memcpy(&pt, &lum[161 + k * 4], 4);
+				memcpy(&ta, &lum[163 + k * 4], 4);
+				logf_("    hole at %.0f %.0f %.0f (PS1 opaque texel at t %.0f, polygon at %.0f; level mesh near it %u, first along the ray at %.0f)", hp[0], hp[1], hp[2], tc,
+				      pt, lum[162 + k * 4], ta);
+			}
+			for (uint32_t k = 0; (k < lum[122]) && (k < 4); k++)
+			{
+				uint32_t sp = lum[123 + k * 4];
+				float bx, by;
+				memcpy(&bx, &lum[125 + k * 4], 4);
+				memcpy(&by, &lum[126 + k * 4], 4);
+				if (sp >= H->numLevelTris)
+				{
+					continue;
+				}
+				const struct RtxLevelTri *t = &((const struct RtxLevelTri *)(R.shm + RTX_OFF_LEVEL_TRIS))[sp];
+				const struct RtxTexSlot *sl = (t->texSlot < H->numTexSlots) ? &((const struct RtxTexSlot *)(R.shm + RTX_OFF_TEX_SLOTS))[t->texSlot] : NULL;
+				logf_("  leak through mesh tri %u (bary %.2f %.2f) slot %u corners %u%u%u flags %x tpage %04x clut %04x uv %u,%u %u,%u %u,%u %u,%u", sp, bx, by,
+				      t->texSlot, t->corner[0], t->corner[1], t->corner[2], t->flags, sl ? sl->tpage : 0, sl ? sl->clut : 0, sl ? sl->uv[0][0] : 0,
+				      sl ? sl->uv[0][1] : 0, sl ? sl->uv[1][0] : 0, sl ? sl->uv[1][1] : 0, sl ? sl->uv[2][0] : 0, sl ? sl->uv[2][1] : 0,
+				      sl ? sl->uv[3][0] : 0, sl ? sl->uv[3][1] : 0);
+			}
+			for (uint32_t k = 0; (k < lum[103]) && (k < 4); k++)
+			{
+				logf_("  crack at pixel %u,%u", lum[106 + k * 3] & 0xffffu, lum[106 + k * 3] >> 16);
+			}
 			const struct RtxLevelTri *lt = (const void *)(R.shm + RTX_OFF_LEVEL_TRIS);
 			const struct RtxTexSlot *ls = (const void *)(R.shm + RTX_OFF_TEX_SLOTS);
 			const struct RtxDynTri *ct = R.capTrisStage.map;

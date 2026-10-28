@@ -445,27 +445,32 @@ void Rtx_OverlayKey(int digit, int back)
 	case 8:
 	{
 		int i = 0;
-		while ((i < 5) && (budgets[i] < S->budgetMs - 0.5f))
+		while ((i < numBudgets - 1) && (budgets[i] < S->budgetMs - 0.5f))
 		{
 			i++;
 		}
-		S->budgetMs = budgets[(i + dir + 6) % 6];
+		S->budgetMs = budgets[(i + dir + numBudgets) % numBudgets];
 		break;
 	}
 	}
+	Rtx_SaveSettings();
 }
 
 void Rtx_HandleKey(int scancode)
 {
 	if (scancode == SDL_SCANCODE_F7)
 	{
-		s_rtx.enabled ^= 1;
-		printf("[RTX] ray tracing %s\n", s_rtx.enabled ? "on" : "off");
+		Rtx_SetEnabled(!s_rtx.enabled);
 	}
 	else if (scancode == SDL_SCANCODE_F5)
 	{
 		s_rtx.lightMode ^= 1;
 		printf("[RTX] lighting: %s\n", s_rtx.lightMode ? "hybrid (track's own lighting + ray traced extras)" : "full relight");
+	}
+	else if ((scancode == SDL_SCANCODE_F6) && ((SDL_GetModState() & SDL_KMOD_CTRL) != 0))
+	{
+		s_probe.want = 1;
+		printf("[RTX] probe: this frame goes to %srtx_probe.txt\n", SDL_GetBasePath());
 	}
 	else if (scancode == SDL_SCANCODE_F6)
 	{
@@ -1346,8 +1351,337 @@ static void Rtx_BuildFloorGrid(const struct RtxLevelVert *verts, int numVerts, c
 	}
 }
 
+// Nitro-Fueled tracks: the remaster's drivable surface (scripts/nf_level.py
+// .floor), a height field of up to `layers` surfaces per cell, loaded once the
+// renderer has the remaster mesh up (RtxHeader.remasterActive)
+static struct
+{
+	char key[64];
+	float minX, minZ, cell;
+	int dimX, dimZ, layers;
+	s16 *h;
+} s_nfFloor;
+
+static int Rtx_NfFloorReady(void)
+{
+	if (!RTX_HDR->remasterActive)
+	{
+		return 0;
+	}
+	if (strcmp(s_nfFloor.key, RTX_HDR->lightsKey) != 0)
+	{
+		free(s_nfFloor.h);
+		memset(&s_nfFloor, 0, sizeof(s_nfFloor));
+		snprintf(s_nfFloor.key, sizeof(s_nfFloor.key), "%s", RTX_HDR->lightsKey);
+		char path[1024];
+		snprintf(path, sizeof(path), "%sassets/rtx_remaster/%s.floor", SDL_GetBasePath(), s_nfFloor.key);
+		FILE *f = fopen(path, "rb");
+		struct
+		{
+			char magic[4];
+			u32 version;
+			float minX, minZ, cell;
+			u32 dimX, dimZ, layers;
+		} hd;
+		if (f && (fread(&hd, sizeof(hd), 1, f) == 1) && !memcmp(hd.magic, "RTXF", 4) && (hd.version == 1) && (hd.cell > 0.0f) && (hd.dimX > 0) &&
+		    (hd.dimZ > 0) && (hd.layers > 0) && (hd.layers <= 8) && ((u64)hd.dimX * hd.dimZ * hd.layers < (64u << 20)))
+		{
+			size_t n = (size_t)hd.dimX * hd.dimZ * hd.layers;
+			s_nfFloor.h = malloc(n * sizeof(s16));
+			if (s_nfFloor.h && (fread(s_nfFloor.h, sizeof(s16), n, f) == n))
+			{
+				s_nfFloor.minX = hd.minX;
+				s_nfFloor.minZ = hd.minZ;
+				s_nfFloor.cell = hd.cell;
+				s_nfFloor.dimX = (int)hd.dimX;
+				s_nfFloor.dimZ = (int)hd.dimZ;
+				s_nfFloor.layers = (int)hd.layers;
+				printf("[RTX] Nitro-Fueled floor %s: %dx%d cells of %.0f\n", path, s_nfFloor.dimX, s_nfFloor.dimZ, s_nfFloor.cell);
+			}
+			else
+			{
+				free(s_nfFloor.h);
+				s_nfFloor.h = NULL;
+			}
+		}
+		if (f)
+		{
+			fclose(f);
+		}
+	}
+	return s_nfFloor.h != NULL;
+}
+
+// one cell's surface nearest to y within range
+static int Rtx_NfFloorCell(int cx, int cz, float y, float range, float *h)
+{
+	if ((cx < 0) || (cz < 0) || (cx >= s_nfFloor.dimX) || (cz >= s_nfFloor.dimZ))
+	{
+		return 0;
+	}
+	const s16 *c = &s_nfFloor.h[((size_t)cz * s_nfFloor.dimX + cx) * s_nfFloor.layers];
+	int found = 0;
+	float best = range;
+	for (int i = 0; i < s_nfFloor.layers; i++)
+	{
+		if ((c[i] != -32768) && (fabsf(c[i] - y) < best))
+		{
+			best = fabsf(c[i] - y);
+			*h = c[i];
+			found = 1;
+		}
+	}
+	return found;
+}
+
+// the remaster floor at (x, z) nearest to y: bilinear over the cell centres
+// around it, or the nearest one found
+static int Rtx_NfFloorHeight(float x, float y, float z, float range, float *h)
+{
+	float fx = (x - s_nfFloor.minX) / s_nfFloor.cell - 0.5f, fz = (z - s_nfFloor.minZ) / s_nfFloor.cell - 0.5f;
+	int x0 = (int)floorf(fx), z0 = (int)floorf(fz);
+	float wx = fx - x0, wz = fz - z0;
+	float c[4], w[4] = {(1 - wx) * (1 - wz), wx * (1 - wz), (1 - wx) * wz, wx * wz};
+	float sum = 0.0f, wsum = 0.0f;
+	for (int i = 0; i < 4; i++)
+	{
+		if (Rtx_NfFloorCell(x0 + (i & 1), z0 + (i >> 1), y, range * 2.0f, &c[i]))
+		{
+			sum += c[i] * w[i];
+			wsum += w[i];
+		}
+	}
+	if (wsum < 1e-4f)
+	{
+		return 0;
+	}
+	float hy = sum / wsum;
+	if (fabsf(hy - y) >= range)
+	{
+		return 0;
+	}
+	*h = hy;
+	return 1;
+}
+
+static int Rtx_Ps1FloorHeight(float x, float y, float z, float range, float *h);
+
 // height of the traced floor at (x, z) nearest to y within range; 0 = none
+// (Nitro-Fueled tracks: the remaster's floor where it has one)
 static int Rtx_FloorHeight(float x, float y, float z, float range, float *h)
+{
+	if (Rtx_NfFloorReady() && Rtx_NfFloorHeight(x, y, z, range, h))
+	{
+		return 1;
+	}
+	return Rtx_Ps1FloorHeight(x, y, z, range, h);
+}
+
+static int Rtx_InstDrawnThisFrame(const void *inst);
+
+static FILE *Rtx_ProbeFile(void)
+{
+	char path[1024];
+	snprintf(path, sizeof(path), "%srtx_probe.txt", SDL_GetBasePath());
+	return fopen(path, "a");
+}
+
+// world -> traced image pixel and view z (view 0), as trace.comp casts its camera rays
+static int Rtx_ProbeProject(const float *p, u32 outW, u32 outH, int *px, int *py, float *z)
+{
+	const struct RtxView *V = &RTX_HDR->views[0];
+	float v[3];
+	for (int r = 0; r < 3; r++)
+	{
+		v[r] = V->camR[r * 3] * p[0] + V->camR[r * 3 + 1] * p[1] + V->camR[r * 3 + 2] * p[2] + V->camT[r];
+	}
+	*z = v[2];
+	if (v[2] < 1.0f)
+	{
+		return 0;
+	}
+	float sx = V->vpX + 0.5f * V->vpW + v[0] * V->projH / v[2], sy = V->vpY + 0.5f * V->vpH + v[1] * V->projH / v[2];
+	*px = (int)(sx / RTX_HDR->dispW * (float)outW);
+	*py = (int)(sy / RTX_HDR->dispH * (float)outH);
+	return (*px >= 0) && (*py >= 0) && (*px < (int)outW) && (*py < (int)outH);
+}
+
+static const char *s_probeBucketName[] = {"player", "robot", "ghost"};
+
+// the game's side of a probe frame: camera, karts and ghosts (drawn or not, why
+// not), the traced floor under them, dynamic triangles that are huge or broken
+static void Rtx_ProbeGame(void)
+{
+	FILE *f = Rtx_ProbeFile();
+	if (f == NULL)
+	{
+		return;
+	}
+	struct GameTracker *gGT = sdata->gGT;
+	const struct RtxView *V = &RTX_HDR->views[0];
+	float cam[3];
+	for (int c = 0; c < 3; c++)
+	{
+		cam[c] = -(V->camR[c] * V->camT[0] + V->camR[3 + c] * V->camT[1] + V->camR[6 + c] * V->camT[2]);
+	}
+	fprintf(f, "\n==== probe: game frame %u, level %d, lights key %s, remaster %u, gameMode1 %08x, camera %.0f %.0f %.0f, debug view %d\n", RTX_HDR->frame + 1,
+	        RTX_HDR->levelID, RTX_HDR->lightsKey, RTX_HDR->remasterActive, (u32)gGT->gameMode1, cam[0], cam[1], cam[2], s_rtx.debugView);
+	fprintf(f, "models traced %d (dyn tris), level polygons captured %d, instance modes capture/glow/GL/hide %d/%d/%d/%d\n", s_rtx.numDyn, s_rtx.numLevelCap,
+	        s_rtx.statInstMode[RTX_INST_CAPTURE], s_rtx.statInstMode[RTX_INST_GLOW], s_rtx.statInstMode[RTX_INST_GL], s_rtx.statInstMode[RTX_INST_HIDE]);
+	for (int b = PLAYER; b <= GHOST; b++)
+	{
+		for (struct Thread *t = gGT->threadBuckets[b].thread; t != NULL; t = t->siblingThread)
+		{
+			struct Instance *inst = t->inst;
+			if (inst == NULL)
+			{
+				continue;
+			}
+			const struct InstDrawPerPlayer *idpp = &inst->idpp[0];
+			float p[3] = {(float)inst->matrix.t[0], (float)inst->matrix.t[1], (float)inst->matrix.t[2]};
+			float h = 0.0f, ps1 = 0.0f;
+			int haveNf = Rtx_FloorHeight(p[0], p[1], p[2], 200.0f, &h), havePs1 = Rtx_Ps1FloorHeight(p[0], p[1], p[2], 200.0f, &ps1);
+			float dx = p[0] - cam[0], dy = p[1] - cam[1], dz = p[2] - cam[2];
+			fprintf(f, "%s model %d at %.0f %.0f %.0f (%.0f from the camera): flags %08x, view 0 flags %08x, header %s, alpha %d, drawn %d; floor traced %s ps1 %s\n",
+			        s_probeBucketName[b], (inst->model != NULL) ? inst->model->id : -1, p[0], p[1], p[2], sqrtf(dx * dx + dy * dy + dz * dz), (u32)inst->flags,
+			        (u32)idpp->instFlags, (idpp->mh != NULL) ? "yes" : "none (not queued)", idpp->alphaScale, Rtx_InstDrawnThisFrame(inst),
+			        haveNf ? "" : "none", havePs1 ? "" : "none");
+			if (haveNf || havePs1)
+			{
+				fprintf(f, "    floor heights: traced %.1f, ps1 %.1f\n", h, ps1);
+			}
+		}
+	}
+	int big = 0;
+	for (int i = 0; i < s_rtx.numDyn; i++)
+	{
+		const struct RtxDynTri *d = &Rtx_DynTris()[i];
+		float m = 0.0f;
+		int bad = 0;
+		for (int a = 0; a < 3; a++)
+		{
+			for (int k = 0; k < 3; k++)
+			{
+				bad |= !isfinite(d->p[a][k]);
+				float e = fabsf(d->p[a][k] - d->p[(a + 1) % 3][k]);
+				m = (e > m) ? e : m;
+			}
+		}
+		if ((bad || (m > 6000.0f)) && (big++ < 20))
+		{
+			fprintf(f, "huge dyn tri %d obj %d flags %x extent %.0f: %.0f %.0f %.0f / %.0f %.0f %.0f / %.0f %.0f %.0f\n", i, d->object, d->flags, m, d->p[0][0], d->p[0][1],
+			        d->p[0][2], d->p[1][0], d->p[1][1], d->p[1][2], d->p[2][0], d->p[2][1], d->p[2][2]);
+		}
+	}
+	fprintf(f, "huge or broken dyn tris: %d\n", big);
+	fclose(f);
+}
+
+// once the probe frame's image is back: each kart / ghost against the traced
+// depth round its spot (GL draws ghosts, discarded where z > depth x 1.02 + 8)
+static void Rtx_ProbeDepth(const float *depth, u32 outW, u32 outH)
+{
+	FILE *f = Rtx_ProbeFile();
+	if ((f == NULL) || (depth == NULL))
+	{
+		if (f != NULL)
+		{
+			fclose(f);
+		}
+		return;
+	}
+	struct GameTracker *gGT = sdata->gGT;
+	for (int b = PLAYER; b <= GHOST; b++)
+	{
+		for (struct Thread *t = gGT->threadBuckets[b].thread; t != NULL; t = t->siblingThread)
+		{
+			struct Instance *inst = t->inst;
+			if (inst == NULL)
+			{
+				continue;
+			}
+			// its body: a little over its origin (the wheels' bottom)
+			float p[3] = {(float)inst->matrix.t[0], (float)inst->matrix.t[1] + 20.0f, (float)inst->matrix.t[2]};
+			int px, py;
+			float z;
+			if (!Rtx_ProbeProject(p, outW, outH, &px, &py, &z))
+			{
+				fprintf(f, "%s: off screen (view z %.0f)\n", s_probeBucketName[b], z);
+				continue;
+			}
+			float dmin = 1e30f, dmax = 0.0f;
+			int pass = 0, n = 0;
+			for (int y = py - 3; y <= py + 3; y++)
+			{
+				for (int x = px - 3; x <= px + 3; x++)
+				{
+					if ((x < 0) || (y < 0) || (x >= (int)outW) || (y >= (int)outH))
+					{
+						continue;
+					}
+					float d = depth[y * (int)outW + x];
+					dmin = (d < dmin) ? d : dmin;
+					dmax = (d > dmax) ? d : dmax;
+					pass += (z <= d * 1.02f + 8.0f);
+					n++;
+				}
+			}
+			fprintf(f, "%s at pixel %d,%d view z %.0f: traced depth there %.0f..%.0f, overlay depth test passes %d of %d pixels\n", s_probeBucketName[b], px, py, z, dmin,
+			        dmax, pass, n);
+		}
+	}
+	fclose(f);
+}
+
+// Nitro-Fueled tracks: a captured model other than a kart (crates, fruit,
+// obstacles, the level's other objects) stands on the PS1 floor; it is moved by
+// how much higher or lower the remaster's floor is under it (as karts are)
+static void Rtx_SeatInstance(int start, int end)
+{
+	if ((end <= start) || !Rtx_NfFloorReady())
+	{
+		return;
+	}
+	struct RtxDynTri *dyn = Rtx_DynTris();
+	float low[3] = {0.0f, 1e30f, 0.0f}, cx = 0.0f, cz = 0.0f;
+	int n = 0;
+	for (int t = start; t < end; t++)
+	{
+		for (int c = 0; c < 3; c++)
+		{
+			const float *p = dyn[t].p[c];
+			if (p[1] < low[1])
+			{
+				low[1] = p[1];
+			}
+			cx += p[0];
+			cz += p[2];
+			n++;
+		}
+	}
+	low[0] = cx / n;
+	low[2] = cz / n;
+	float ps1, nf;
+	if (!Rtx_Ps1FloorHeight(low[0], low[1], low[2], 150.0f, &ps1) || !Rtx_NfFloorHeight(low[0], ps1, low[2], 60.0f, &nf))
+	{
+		return;
+	}
+	float d = nf - ps1;
+	if ((fabsf(d) < 0.5f) || (fabsf(d) > 60.0f))
+	{
+		return;
+	}
+	for (int t = start; t < end; t++)
+	{
+		for (int c = 0; c < 3; c++)
+		{
+			dyn[t].p[c][1] += d;
+		}
+	}
+}
+
+// the PS1 level's floor (s_floor) at (x, z) nearest to y within range; 0 = none
+static int Rtx_Ps1FloorHeight(float x, float y, float z, float range, float *h)
 {
 	if (s_floor.dimX <= 0)
 	{
@@ -3342,7 +3676,20 @@ int Rtx_RenderFrame(int outW, int outH, const u8 **rgba, const float **depth)
 	memcpy(&Rtx_DynTris()[s_rtx.numDyn], s_rtx.smoke, sizeof(struct RtxDynTri) * smoke);
 	s_rtx.numDyn += smoke;
 	s_rtx.numSmoke = 0;
+	const char *probeEnv = getenv("CTR_RTX_PROBE_FRAME"); // (test runs: probes at these ray traced frames, comma separated)
+	for (const char *e = probeEnv; (e != NULL) && (*e != 0); e = strchr(e, ',') ? strchr(e, ',') + 1 : NULL)
+	{
+		s_probe.want |= (atoi(e) > 0) && (RTX_HDR->frame + 1u == (u32)atoi(e));
+	}
+	if (s_probe.want)
+	{
+		s_probe.want = 0;
+		s_probe.pending = 1;
+		Rtx_ProbeGame();
+		RTX_HDR->probe++; // (the renderer adds its camera rays to the file)
+	}
 	RTX_HDR->numDynTris = (u32)s_rtx.numDyn;
+	Rtx_PublishProxies();
 	RTX_HDR->numLevelCap = (u32)s_rtx.numLevelCap; // last frame's; this frame's walk refills the section
 	s_rtx.numLevelCap = 0;
 	RTX_HDR->outW = (u32)outW;
@@ -3402,5 +3749,10 @@ int Rtx_RenderFrame(int outW, int outH, const u8 **rgba, const float **depth)
 	u32 slot = (pipelined ? req - 1u : req) & 1u;
 	*rgba = s_rtx.base + RTX_OFF_IMAGE + slot * RTX_SLOT_BYTES;
 	*depth = (const float *)(s_rtx.base + RTX_OFF_DEPTH + slot * RTX_SLOT_BYTES);
+	if (s_probe.pending)
+	{
+		s_probe.pending = 0;
+		Rtx_ProbeDepth(*depth, outW, outH);
+	}
 	return 1;
 }

@@ -216,10 +216,15 @@ struct RtxHeader
 	struct RtxSettings settings;
 	float passMs[RTX_PASS_COUNT]; // renderer: averaged pass timings (RtxPass)
 	uint32_t inW, inH;            // renderer: traced (internal) size
-	float texNearDepth;           // view z past which the PS1 draws the level with its lower textures (0 = none)
+	uint32_t probe;               // game: bumped (Ctrl+F6) = describe this frame's camera rays in rtx_probe.txt
 	float sky[RTX_SKY_H][RTX_SKY_W][3]; // display colours of the level's skybox / gradient by direction
 
 	struct RtxPointLight dynLights[RTX_MAX_DYN_LIGHTS];
+
+	// frame: instances of the remasterProxy models (moving PS1 objects the
+	// renderer draws as remaster models), in the level's instance order
+	uint32_t numProxy;
+	struct RtxProxyInst proxy[RTX_MAX_PROXY];
 };
 
 _Static_assert(sizeof(struct RtxLevelVert) == 16, "RtxLevelVert layout");

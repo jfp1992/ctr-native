@@ -199,6 +199,39 @@ vec3 dynLightSamples(vec3 p, vec3 n, vec3 ng, bool dynamic, uint count, inout ui
 	return sum / float(count);
 }
 
+// Ctrl+F6 probe (ctr_rtx.c writes rtx_probe.txt): three columns of pixels
+// (1/4, 1/2, 3/4 across) every 1/32 of the height down the lower 3/4; each
+// pixel's record is 16 words from lumSums[256]: pixel, camera hit (inst, prim,
+// t; after any see-through layer), its material, albedo luma before / after the
+// remaster decals and how many, the layer's alpha, the sun shadow ray's
+// occluder (inst, prim, t), this frame's light luma, the first hit's inst
+int g_probe = -1;
+
+int probeRecord(uvec2 px, uint outW, uint outH)
+{
+	if (F.extra2.w == 0u)
+	{
+		return -1;
+	}
+	uint y0 = outH / 4u, step = max(outH * 3u / 4u / 24u, 1u);
+	if ((px.y < y0) || (((px.y - y0) % step) != 0u) || ((px.y - y0) / step >= 24u))
+	{
+		return -1;
+	}
+	uint c = (px.x == outW / 4u) ? 0u : (px.x == outW / 2u) ? 1u : (px.x == outW * 3u / 4u) ? 2u : 3u;
+	return (c == 3u) ? -1 : int(256u + (c * 24u + (px.y - y0) / step) * 16u);
+}
+
+void probeWord(uint i, uint v)
+{
+	if (g_probe >= 0)
+	{
+		lumSums[uint(g_probe) + i] = v;
+	}
+}
+
+float probeLuma(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
+
 void main()
 {
 	uvec2 px = gl_GlobalInvocationID.xy;
@@ -239,24 +272,64 @@ void main()
 	// knows where each sample lies); else a random one per pixel
 	vec2 jitter = vec2(rnd(rng), rnd(rng));
 	jitter = (F.outSize.z != 0u) ? F.jitter.xy : jitter;
-	float H = F.proj.x;
-	vec2 disp = vec2(F.proj2.y, F.proj2.z);
+	float H = V.proj.x;
+	vec2 disp = vec2(V.proj2.y, V.proj2.z);
 	vec2 s = (vec2(px) + jitter) / vec2(outW, outH) * disp;
-	vec2 c = s - vec2(F.proj.y, F.proj.z) - 0.5 * vec2(F.proj.w, F.proj2.x);
+	vec2 c = s - vec2(V.proj.y, V.proj.z) - 0.5 * vec2(V.proj.w, V.proj2.x);
 	vec3 viewDir = vec3(c / H, 1.0);
-	vec3 dir = normalize(vec3(dot(F.rInv[0].xyz, viewDir), dot(F.rInv[1].xyz, viewDir), dot(F.rInv[2].xyz, viewDir)));
-	vec3 origin = F.camPos.xyz;
+	vec3 dir = normalize(vec3(dot(V.rInv[0].xyz, viewDir), dot(V.rInv[1].xyz, viewDir), dot(V.rInv[2].xyz, viewDir)));
+	vec3 origin = V.camPos.xyz;
 	float exposure = F.sunColor.w;
 
 	uint inst, prim;
 	vec2 bary;
 	float t = traceClosest(origin, dir, 1e8, true, inst, prim, bary);
+	// the level mesh's own texture can be colour keyed (see-through) where the
+	// PS1 draws that polygon opaque (another texture or mapping up close): a
+	// hole to the sky (or whatever is behind) only the ray tracer would have.
+	// The nearest opaque texel the PS1 drew on this ray decides: the mesh
+	// surface there is hit (not on remaster tracks: their mesh is drawn in the
+	// level's place)
+	if (F.extra.y == 0u)
+	{
+		float tc = capOpaqueAlong(origin, dir);
+		float slack = max(8.0, 0.03 * tc);
+		if ((tc > 0.0) && ((t < 0.0) || (tc < t - slack)) && levelNear(origin, dir, tc, slack))
+		{
+			t = g_alongT;
+			inst = INST_LEVEL;
+			prim = g_alongPrim;
+			bary = g_alongBary;
+		}
+	}
 
+	probeWord(13u, (t >= 0.0) ? inst : 0xffffffffu);
 	// semi-transparent layer in front: water, glass, glows
 	vec4 layer = vec4(0.0);
+	layerCur[idx] = vec4(0.0); // (layerReflection: where there's a reflecting layer)
 	vec3 rayO = origin;
 	if (t >= 0.0)
 	{
+		// a see-through level polygon laid over an opaque one (the hubs'
+		// tunnels: a light layer a unit off the wall, drawn after it by the
+		// PS1): the RT hardware doesn't offer candidates past a committed hit,
+		// so whichever of the two is nearer would show, pixel by pixel (z
+		// fighting). It is looked for explicitly and is the layer over the wall
+		if (inst == INST_LEVEL)
+		{
+			uint dp;
+			vec2 db;
+			float dt = semiOverlayNear(origin, dir, t, decalMargin(t), prim, dp, db);
+			// (as when the layer is hit first: no test against the texture layer,
+			// which is a frame old and would pass on some pixels, not others,
+			// while the camera moves)
+			if (dt >= 0.0)
+			{
+				t = dt;
+				prim = dp;
+				bary = db;
+			}
+		}
 		g_texFilter = true; // (camera hits: filtered texels)
 		Surface ls = surfaceAt(inst, prim, bary, dir);
 		g_texFilter = false;
@@ -313,9 +386,95 @@ void main()
 		}
 	}
 	layerOut[idx] = layer;
+	probeWord(1u, (t >= 0.0) ? inst : 0xffffffffu);
+	probeWord(2u, prim);
+	probeWord(3u, floatBitsToUint(t));
+	probeWord(4u, ((t >= 0.0) && (inst >= INST_REM)) ? remTriMat[remTri(inst, prim)] : 0xffffffffu);
+	probeWord(8u, floatBitsToUint(layer.a));
+	probeWord(15u, 1u);
 
 	if (t < 0.0)
 	{
+		// diagnostics: sky seen where the level is (one pixel in 64): through a
+		// see-through texel of the level mesh, or a crack between its faces
+		if (((px.x & 7u) == 0u) && ((px.y & 7u) == 0u))
+		{
+			atomicAdd(lumSums[100], 1u);
+			uint pp;
+			vec2 pb;
+			float pt;
+			if (capAlong(origin, dir, pp, pb, pt))
+			{
+				// the PS1 drew a polygon on this ray: opaque texel there = a hole only the ray tracer has
+				atomicAdd(lumSums[140], 1u);
+				uint pflags = capTris[pp * 16u + 14u] >> 16;
+				if (((pflags >> TRI_VIEW_SHIFT) == uint(g_view)) && capturedTexelShows(pp, pb, false))
+				{
+					atomicAdd(lumSums[141], 1u);
+					uint k4 = atomicAdd(lumSums[142], 1u);
+					if (k4 < 4u)
+					{
+						float tc = capOpaqueAlong(origin, dir);
+						lumSums[160u + k4 * 4u] = floatBitsToUint(tc);
+						lumSums[161u + k4 * 4u] = floatBitsToUint(pt);
+						lumSums[162u + k4 * 4u] = levelNear(origin, dir, pt, max(8.0, 0.03 * pt)) ? 1u : 0u;
+						lumSums[163u + k4 * 4u] = levelAlong(origin, dir) ? floatBitsToUint(g_alongT) : 0u;
+						vec3 hp = origin + dir * pt;
+						lumSums[143u + k4 * 3u] = floatBitsToUint(hp.x);
+						lumSums[144u + k4 * 3u] = floatBitsToUint(hp.y);
+						lumSums[145u + k4 * 3u] = floatBitsToUint(hp.z);
+					}
+				}
+			}
+			if (levelAlong(origin, dir))
+			{
+				atomicAdd(lumSums[101], 1u);
+				// the PS1's own polygon there (texture layer): opaque, see-through, none
+				uint cp;
+				vec2 cb;
+				float tl = g_alongT;
+				if (traceCaptured(origin, dir, tl, max(8.0, 0.03 * tl), false, cp, cb))
+				{
+					atomicAdd(lumSums[120], 1u);
+				}
+				else if (traceCaptured(origin, dir, tl, max(8.0, 0.03 * tl), true, cp, cb))
+				{
+					atomicAdd(lumSums[121], 1u);
+				}
+				uint k3 = atomicAdd(lumSums[122], 1u);
+				if (k3 < 4u)
+				{
+					uint w1 = levelTris[g_alongPrim * 3u + 1u], w2 = levelTris[g_alongPrim * 3u + 2u];
+					lumSums[123u + k3 * 4u] = g_alongPrim;
+					lumSums[124u + k3 * 4u] = w2;
+					lumSums[125u + k3 * 4u] = floatBitsToUint(g_alongBary.x);
+					lumSums[126u + k3 * 4u] = floatBitsToUint(g_alongBary.y);
+				}
+			}
+			else
+			{
+				vec3 dx = vec3(dot(V.rInv[0].xyz, vec3(disp.x / float(outW) / H, 0.0, 0.0)), dot(V.rInv[1].xyz, vec3(disp.x / float(outW) / H, 0.0, 0.0)),
+				               dot(V.rInv[2].xyz, vec3(disp.x / float(outW) / H, 0.0, 0.0)));
+				vec3 dy = vec3(dot(V.rInv[0].xyz, vec3(0.0, disp.y / float(outH) / H, 0.0)), dot(V.rInv[1].xyz, vec3(0.0, disp.y / float(outH) / H, 0.0)),
+				               dot(V.rInv[2].xyz, vec3(0.0, disp.y / float(outH) / H, 0.0)));
+				vec3 d0 = normalize(vec3(dot(V.rInv[0].xyz, viewDir), dot(V.rInv[1].xyz, viewDir), dot(V.rInv[2].xyz, viewDir)));
+				float k = length(vec3(dot(V.rInv[0].xyz, viewDir), dot(V.rInv[1].xyz, viewDir), dot(V.rInv[2].xyz, viewDir)));
+				dx /= k;
+				dy /= k;
+				if ((levelAlong(origin, normalize(d0 + dx)) && levelAlong(origin, normalize(d0 - dx))) ||
+				    (levelAlong(origin, normalize(d0 + dy)) && levelAlong(origin, normalize(d0 - dy))))
+				{
+					atomicAdd(lumSums[102], 1u);
+					uint k2 = atomicAdd(lumSums[103], 1u);
+					if (k2 < 4u)
+					{
+						lumSums[104u + k2 * 3u] = floatBitsToUint(origin.x + d0.x * 3000.0);
+						lumSums[105u + k2 * 3u] = floatBitsToUint(origin.y + d0.y * 3000.0);
+						lumSums[106u + k2 * 3u] = px.x | (px.y << 16);
+					}
+				}
+			}
+		}
 		albedoOut[idx] = vec4(0.0);
 		geoCur[idx] = vec4(0.0, 0.0, 0.0, -1.0);
 		histCur[idx] = vec4(0.0);
@@ -732,9 +891,13 @@ void main()
 	// averaged (a-trous blurs by it; young pixels get theirs from their neighbours)
 	momCur[idx] = vec4(mom, 0.0, 0.0);
 	combined[idx] = vec4(hist.rgb + histDyn.rgb, max(mom.y - mom.x * mom.x, 0.0) / hist.a);
+	probeWord(12u, floatBitsToUint(probeLuma(hist.rgb + histDyn.rgb) * exposure));
 	geoCur[idx] = vec4(n, viewZ);
 	// a: 1 level, 2 model, 3 glowing (a-trous keeps them apart; final blooms 3);
 	// +0.25: level pixel the texture layer missed (debug view 5)
-	bool glowing = ((sf.flags & TRI_EMISSIVE) != 0u) && (sf.blend == 3u) && (F.extra.z != 0u);
-	albedoOut[idx] = vec4(sf.albedo, (glowing ? 3.0 : ((inst == INST_LEVEL) ? 1.0 : 2.0)) + (capMiss ? 0.25 : 0.0));
+	bool glowing = ((((sf.flags & TRI_EMISSIVE) != 0u) && (sf.blend == 3u)) || (luma(sf.emission) > 0.1)) && (F.extra.z != 0u);
+	// models as bright against the level as the PS1 shows them (ctr_rtx.c: the
+	// frame's model / level brightness, traced against the PS1's)
+	vec3 shownAlbedo = (sf.dynamic && (F.wind.w > 0.0)) ? sf.albedo * F.wind.w : sf.albedo;
+	albedoOut[idx] = vec4(shownAlbedo, (glowing ? 3.0 : ((inst != INST_DYN) ? 1.0 : 2.0)) + (capMiss ? 0.25 : 0.0));
 }

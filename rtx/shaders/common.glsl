@@ -1033,6 +1033,83 @@ void surfaceMaterial(inout Surface s, TriData d, uint inst)
 	}
 }
 
+// decals (mask 0x40) on a camera hit at t along o + d t: up to 4 within a short
+// height over its surface (they float a little over what they decorate:
+// carpets, road markings, ice), laid over its colour farthest first, each by
+// its texture alpha x vertex alpha (Alchemy GBufferDecal: colour only); an ice
+// decal makes the surface ice
+uint g_decalCount = 0u; // (the last remDecals: how many it laid on; the Ctrl+F6 probe)
+
+void remDecals(vec3 o, vec3 d, float t, inout Surface s)
+{
+	// (the height measured along the surface's normal: at grazing angles the
+	// decal lies far ahead along the ray). Below the surface only a fixed
+	// 2 units: Nitro-Fueled hides decals further under floors (Oxide Station's
+	// tubes: near-black ones 6.4 under), a reach growing with distance laid
+	// them over far floors as black
+	float cosA = max(abs(dot(d, s.geoNormal)), 0.08);
+	float above = (14.0 + 0.002 * t) / cosA, below = 2.0 / cosA;
+	rayQueryEXT rq;
+	rayQueryInitializeEXT(rq, tlas, gl_RayFlagsNoneEXT, 0x40u, o, max(t - above, 0.0), d, t + below);
+	bool ice = false;
+	float dt[4];
+	vec4 dc[4];
+	int n = 0;
+	while (rayQueryProceedEXT(rq))
+	{
+		if ((rayQueryGetIntersectionTypeEXT(rq, false) != gl_RayQueryCandidateIntersectionTriangleEXT) || (n >= 4))
+		{
+			continue;
+		}
+		uint tr = remTri(INST_REM_DECAL, uint(rayQueryGetIntersectionPrimitiveIndexEXT(rq, false)));
+		vec2 b = rayQueryGetIntersectionBarycentricsEXT(rq, false);
+		vec3 w = vec3(1.0 - b.x - b.y, b.x, b.y);
+		uint v0 = remIdx[tr * 3u], v1 = remIdx[tr * 3u + 1u], v2 = remIdx[tr * 3u + 2u];
+		vec2 t0 = remUv(v0), t1 = remUv(v1), t2 = remUv(v2);
+		vec3 p0 = remPos(v0), p1 = remPos(v1), p2 = remPos(v2);
+		vec4 vc = remColor(v0) * w.x + remColor(v1) * w.y + remColor(v2) * w.z;
+		uvec4 m = remMats[remTriMat[tr] * 3u];
+		vec4 c = remSample(m.x, t0 * w.x + t1 * w.y + t2 * w.z, remLodBase(p0, p1, p2, t0, t1, t2, p0 * w.x + p1 * w.y + p2 * w.z, true));
+		float a = c.a * vc.a;
+		if (a > 0.01)
+		{
+			dt[n] = rayQueryGetIntersectionTEXT(rq, false);
+			dc[n] = vec4(c.rgb * vc.rgb, a);
+			n++;
+			ice = ice || (((m.w & MAT_ICE) != 0u) && (a > 0.5));
+		}
+	}
+	s.flags |= ice ? TRI_ICE : 0u;
+	g_decalCount = uint(n);
+	for (int i = 1; i < n; i++) // farthest first
+	{
+		for (int j = i; (j > 0) && (dt[j] > dt[j - 1]); j--)
+		{
+			float tt = dt[j];
+			dt[j] = dt[j - 1];
+			dt[j - 1] = tt;
+			vec4 cc = dc[j];
+			dc[j] = dc[j - 1];
+			dc[j - 1] = cc;
+		}
+	}
+	for (int i = 0; i < n; i++)
+	{
+		s.albedo = mix(s.albedo, min(srgbToLinear(dc[i].rgb), vec3(0.95)), dc[i].a);
+		s.ps1Color = mix(s.ps1Color, dc[i].rgb, dc[i].a);
+	}
+}
+
+// world direction of the camera ray through traced pixel position px (pixel + offset 0..1)
+vec3 cameraRayDir(vec2 px)
+{
+	vec2 disp = vec2(V.proj2.y, V.proj2.z);
+	vec2 sc = px / vec2(F.size.xy) * disp;
+	vec2 c = sc - vec2(V.proj.y, V.proj.z) - 0.5 * vec2(V.proj.w, V.proj2.x);
+	vec3 v = vec3(c / V.proj.x, 1.0);
+	return normalize(vec3(dot(V.rInv[0].xyz, v), dot(V.rInv[1].xyz, v), dot(V.rInv[2].xyz, v)));
+}
+
 // ---- random numbers --------------------------------------------------------
 
 uint pcg(inout uint state)
