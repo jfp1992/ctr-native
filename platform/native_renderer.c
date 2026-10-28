@@ -891,6 +891,7 @@ const char *gte_shader_32_rgba = "	uniform sampler2D s_texture;\n"
                                  "	void main() {\n"
                                  "		vec2 tc = v_texcoord.xy * texelSize + texelSize * 0.5;\n"
                                  "		vec4 color = texture2D(s_texture, tc);\n"
+                                 "		if (color.a < 0.5) { discard; }\n" /* MultiTrack: transparent texels (NF minimaps) */
                                  "		fragColor = dither(color * v_color);\n"
                                  "		fragColor.a = float(psxDrawMaskSet);\n"
                                  "	}\n";
