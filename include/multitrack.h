@@ -57,6 +57,17 @@ struct MTHeader *MT_Table(void);
 
 // custom track currently loaded (redirect active for gGT->levelID), or NULL
 struct MTEntry *MT_ActiveEntry(void);
+int MT_EntryKey(const struct MTEntry *e, char *key, size_t size); // an NF entry's asset key (nf-<slot> / nf-<id>), 0: not NF
+
+// NF minimaps (MT_Map.c, assets/track_maps/<key>.png + .map: scripts/nf_minimap.py)
+struct MTMap
+{
+	unsigned int tex; // TextureID
+	short x0, x1, z0, z1, w, h; // world range the image spans (PS1), its size in HUD pixels
+};
+const struct MTMap *MT_Map_Find(const struct MTEntry *e); // NULL: none
+struct UIMap *MT_Map_RaceMap(void);                       // the race's NF minimap for the karts' dots, NULL: none
+int MT_Map_DrawRace(int posX, int posY);                  // drew the NF minimap (bottom-right at posX, posY)
 
 // CTR_BOOT_LEVEL / CTR_BOOT_TRACK env: boot straight into a level (debug, screenshots)
 int MT_BootLevel(int defaultLevel);

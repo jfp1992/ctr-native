@@ -79,21 +79,7 @@ static void MT_Coll_Free(void)
 // pack_tracks.py put in the author field), or 0
 static int MT_Coll_Key(char *key, size_t size)
 {
-	struct MTEntry *e = MT_ActiveEntry();
-	if ((e == NULL) || !(e->flags & MT_FLAG_REMASTER))
-		return 0;
-	if (!strncmp(e->author, "NF-", 3))
-	{
-		size_t i = 0;
-		for (; (i + 1 < size) && (i < MT_AUTHOR_LEN) && e->author[i]; i++)
-			key[i] = (char)((e->author[i] >= 'A') && (e->author[i] <= 'Z') ? e->author[i] + 32 : e->author[i]);
-		key[i] = 0;
-	}
-	else
-	{
-		snprintf(key, size, "nf-%d", e->slot);
-	}
-	return 1;
+	return MT_EntryKey(MT_ActiveEntry(), key, size);
 }
 
 // a native track's race section (scripts/nf_collision.py race_bytes, each part

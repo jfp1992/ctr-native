@@ -74,6 +74,26 @@ struct MTEntry *MT_ActiveEntry(void)
 	return NULL;
 }
 
+// an NF entry's asset key ("nf-<slot>", or the key pack_tracks.py put in the
+// author field, lower case): 0 for any other entry
+int MT_EntryKey(const struct MTEntry *e, char *key, size_t size)
+{
+	if ((e == NULL) || !(e->flags & MT_FLAG_REMASTER))
+		return 0;
+	if (!strncmp(e->author, "NF-", 3))
+	{
+		size_t i = 0;
+		for (; (i + 1 < size) && (i < MT_AUTHOR_LEN) && e->author[i]; i++)
+			key[i] = (char)((e->author[i] >= 'A') && (e->author[i] <= 'Z') ? e->author[i] + 32 : e->author[i]);
+		key[i] = 0;
+	}
+	else
+	{
+		snprintf(key, size, "nf-%d", e->slot);
+	}
+	return 1;
+}
+
 int MT_ShotClean(void)
 {
 	static int s_clean = -1;

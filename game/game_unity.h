@@ -267,6 +267,7 @@
 
 #include "230.c"
 #include "MultiTrack/MT_TrackSelect.c" // MultiTrack: replaces MM_TrackSelect_MenuProc
+#include "MultiTrack/MT_Map.c"         // MultiTrack: Nitro-Fueled tracks' minimaps
 #include "MultiTrack/MT_Settings.c"    // MultiTrack: Settings (cog on the main menu)
 
 #include "231/R231.c"

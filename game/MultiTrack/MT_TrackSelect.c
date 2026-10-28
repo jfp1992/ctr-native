@@ -296,7 +296,9 @@ static void MT_DrawPanel(struct GameTracker *gGT, struct MainMenu_LevelRow *stoc
 	// none, nor NF tracks on a fan remake (key "NF-<id>" in their author field;
 	// "NF-<slot>": a stock level with NF collision, its own map)
 	int stockMap = !custom || ((custom->flags & MT_FLAG_REMASTER) && (strncmp(custom->author, "NF-", 3) || ((custom->author[3] >= '0') && (custom->author[3] <= '9'))));
-	int mapID = (stockRow && stockMap) ? stockRow->mapTextureID : -1;
+	// (NF tracks: their own, scripts/nf_minimap.py)
+	const struct MTMap *nfMap = custom ? MT_Map_Find(custom) : NULL;
+	int mapID = (!nfMap && stockRow && stockMap) ? stockRow->mapTextureID : -1;
 	// (one layout for every row, the retail one with a map: title, picture and
 	// the lines under it stay put while scrolling; no map, its place left empty)
 	RECT16 r = {MM_TRACK_TRANSITIONS[1].currX + MM_TRACK_SELECT_PREVIEW_X + dx, MM_TRACK_TRANSITIONS[1].currY + MM_TRACK_SELECT_PREVIEW_Y_WITH_MAP,
@@ -318,13 +320,21 @@ static void MT_DrawPanel(struct GameTracker *gGT, struct MainMenu_LevelRow *stoc
 	}
 	r.y += MM_TRACK_SELECT_TITLE_TO_MAP_Y;
 
-	if ((mapID >= 0) && (MM_TRACK_LAP_BOX_OPEN == 0))
+	if (((mapID >= 0) || nfMap) && (MM_TRACK_LAP_BOX_OPEN == 0))
 	{
 		RECT16 mapRect = r;
 		mapRect.h = MM_TRACK_SELECT_MAP_BOX_H;
 		mapRect.x += MM_TRACK_TRANSITIONS[2].currX - MM_TRACK_TRANSITIONS[1].currX; // (dx: in r.x)
 		mapRect.y += MM_TRACK_TRANSITIONS[2].currY - MM_TRACK_TRANSITIONS[1].currY + MM_TRACK_SELECT_MAP_CENTER_Y_OFFSET;
-		MT_DrawMap(gGT, mapID, mapRect);
+		if (nfMap)
+		{
+			MT_DrawPicture(nfMap->tex, mapRect.x + mapRect.w / 2 - nfMap->w / 2, mapRect.y + mapRect.h / 2 - nfMap->h / 2, nfMap->w, nfMap->h,
+			               gGT->pushBuffer_UI.ptrOT, &gGT->backBuffer->primMem);
+		}
+		else
+		{
+			MT_DrawMap(gGT, mapID, mapRect);
+		}
 	}
 
 	// the picture (none taken: the retail thumbnail, stock tracks only)
@@ -360,7 +370,7 @@ static void MT_DrawPanel(struct GameTracker *gGT, struct MainMenu_LevelRow *stoc
 			MT_DrawText("USE TIME TRIAL OR VS", cx, y + lineH, scale, JUSTIFY_CENTER | RED);
 			y += 2 * lineH;
 		}
-		if (mapID < 0)
+		if ((mapID < 0) && !nfMap)
 		{
 			char count[32];
 			snprintf(count, sizeof(count), "%d/%d  L1/R1 PAGE", cursor + 1, numRows);

@@ -110,6 +110,13 @@ void UI_RenderFrame_Racing()
 		void **pointers = ST1_GETPOINTERS(gGT->level1->ptrSpawnType1);
 		levPtrMap = pointers[ST1_MAP];
 	}
+#ifdef CTR_NATIVE
+	// MultiTrack: an NF track's own minimap (MT_Map.c)
+	if (MT_Map_RaceMap() != NULL)
+	{
+		levPtrMap = MT_Map_RaceMap();
+	}
+#endif
 
 	// If you are not in Relic Race, and not in battle mode,
 	// and not in time trial
@@ -770,6 +777,9 @@ void UI_RenderFrame_Racing()
 			}
 
 			// Draw the map
+#ifdef CTR_NATIVE
+			if (!MT_Map_DrawRace(mapPosX, mapPosY)) // MultiTrack: an NF track's own
+#endif
 			UI_Map_DrawMap(
 			    // top half and bottom half
 			    gGT->ptrIcons[3], gGT->ptrIcons[4],
