@@ -56,6 +56,14 @@ struct MTEntry *MT_ActiveEntry(void)
 		return NULL;
 	}
 
+	// (the entry picked: Nitro-Fueled tracks over a stock slot all use that slot's
+	// own bigfile entries, so redirectBase alone doesn't tell them apart)
+	int picked = gMTState.entry - 1;
+	if ((picked >= 0) && (picked < table->count) && (table->entries[picked].slot == gMTState.redirectLevel) &&
+	    (table->entries[picked].bigBase == gMTState.redirectBase))
+	{
+		return &table->entries[picked];
+	}
 	for (int i = 0; i < table->count; i++)
 	{
 		if (table->entries[i].bigBase == gMTState.redirectBase)
@@ -212,6 +220,7 @@ int MT_BootLevel(int defaultLevel)
 			gMTState.magic = MT_MAGIC;
 			gMTState.redirectLevel = table->entries[n].slot;
 			gMTState.redirectBase = table->entries[n].bigBase;
+			gMTState.entry = (short)(n + 1);
 			printf("[MultiTrack] boot: custom track %d '%s' on slot %d\n", n, table->entries[n].name, table->entries[n].slot);
 			return table->entries[n].slot;
 		}

@@ -1728,6 +1728,11 @@ static int Rtx_Ps1FloorHeight(float x, float y, float z, float range, float *h)
 // under it; grounded, the kart (wheels and body) moves by their mean gap
 static void Rtx_SeatKart(const void *inst, int wheelStart, int wheelEnd)
 {
+	// (karts on the Nitro-Fueled collision already sit on the NF surfaces)
+	if (MT_Coll_On())
+	{
+		return;
+	}
 	struct RtxDynTri *dyn = Rtx_DynTris();
 	float gapSum = 0.0f;
 	int n = 0, wheels = 0;

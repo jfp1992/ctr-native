@@ -108,6 +108,7 @@
 #include "LOAD/LOAD_File.c"
 #include "LOAD/LOAD_Howl.c"
 #include "MultiTrack/MultiTrack.c"
+#include "MultiTrack/MT_NfColl.c" // MultiTrack: Nitro-Fueled collision
 #include "LOAD/LOAD_Assets.c"
 #include "LOAD/LOAD_Queue.c"
 #include "LOAD/LOAD_Hub.c"

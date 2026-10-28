@@ -113,6 +113,13 @@ void COLL_SearchBSP_CallbackPARAM(struct BSP *root, struct BoundingBox *bbox, Co
 		return;
 	}
 
+	// MultiTrack: NF tracks search the Nitro-Fueled level's BSP (MT_NfColl.c)
+	root = MT_Coll_Root(root);
+	if (MT_Coll_SearchWide(root, bbox, callback, sps))
+	{
+		return;
+	}
+
 	struct BoundingBox bounds = *bbox;
 
 	// Retail stores pending child IDs at scratchpad 0x1f800070 and pops them
@@ -471,7 +478,7 @@ internal void COLL_FIXED_QUADBLK_SetLoadScratchpadVertsContext(struct Scratchpad
 {
 	// NOTE(aalhendi): Retail passes these through implicit MIPS registers t8/t9.
 	// Native records that register state explicitly before calling the loader.
-	sCollFixedLoadScratchpadVertsVertexArray = sps->ptr_mesh_info->ptrVertexArray;
+	sCollFixedLoadScratchpadVertsVertexArray = MT_Coll_QuadVerts(sps->ptr_mesh_info->ptrVertexArray, quad); // MultiTrack: NF quads' own vertices
 	sCollFixedLoadScratchpadVertsQuad = quad;
 }
 
@@ -516,6 +523,19 @@ void COLL_FIXED_QUADBLK_GetNormVecs_LoLOD(struct ScratchpadStruct *sps, struct Q
 	}
 	sps->collision.triNormalVecDividend = triNormalDividends[QUADBLOCK_TRI_NORMAL_DIVIDEND_LO_0];
 	COLL_FIXED_TRIANGL_GetNormVec(sps, &bsv[0], &bsv[1], &bsv[2]); // 0, 1, 2
+}
+
+
+// MultiTrack: one Nitro-Fueled triangle (MT_NfColl.c): vertices 0, 1, 2 at full
+// precision, its normal's scale in triNormalVecDividend[LO_0]
+internal void COLL_FIXED_QUADBLK_GetNormVecs_NfTri(struct ScratchpadStruct *sps, struct QuadBlock *quad)
+{
+	COLL_FIXED_QUADBLK_SetLoadScratchpadVertsContext(sps, quad);
+	COLL_FIXED_QUADBLK_LoadScratchpadVerts(sps);
+	sps->collision.triNormalLodShift = 0;
+	sps->collision.triNormalVecBitShift = quad->triNormalVecBitShift;
+	sps->collision.triNormalVecDividend = quad->triNormalVecDividend[QUADBLOCK_TRI_NORMAL_DIVIDEND_LO_0];
+	COLL_FIXED_TRIANGL_GetNormVec(sps, &sps->bspSearchVert[0], &sps->bspSearchVert[1], &sps->bspSearchVert[2]);
 }
 
 
@@ -576,6 +596,14 @@ void COLL_FIXED_QUADBLK_TestTriangles(struct QuadBlock *quad, struct ScratchpadS
 	    (quad->bbox.min.x > sps->bbox.max.x) || (quad->bbox.min.y > sps->bbox.max.y) || (quad->bbox.min.z > sps->bbox.max.z) ||
 	    (sps->bbox.min.x > quad->bbox.max.x) || (sps->bbox.min.y > quad->bbox.max.y) || (sps->bbox.min.z > quad->bbox.max.z))
 	{
+		return;
+	}
+
+	// MultiTrack: a Nitro-Fueled triangle, as it is
+	if (MT_Coll_IsTriangle(quad))
+	{
+		COLL_FIXED_QUADBLK_GetNormVecs_NfTri(sps, quad);
+		COLL_FIXED_TRIANGL_TestPoint(sps, &bsv[0], &bsv[1], &bsv[2]);
 		return;
 	}
 
@@ -1007,7 +1035,7 @@ void COLL_FIXED_PlayerSearch(struct Thread *t, struct Driver *d)
 		d->terrainMeta2 = VehAfterColl_GetTerrain(TERRAIN_NONE);
 	}
 
-	if (d->posCurr.y < CTR_MipsSll(CTR_MipsSubLo(level->ptr_mesh_info->bspRoot->box.min.y, 0x40), 8))
+	if (d->posCurr.y < CTR_MipsSll(CTR_MipsSubLo(MT_Coll_Root(level->ptr_mesh_info->bspRoot)->box.min.y, 0x40), 8)) // MultiTrack: NF's bottom on NF tracks
 	{
 		d->collisionFlags |= DRIVER_COLL_FLAG_MASK_GRAB_REQUEST;
 	}
@@ -1610,6 +1638,15 @@ void COLL_MOVED_QUADBLK_TestTriangles(struct QuadBlock *quad, struct ScratchpadS
 		return;
 	}
 
+	// MultiTrack: a Nitro-Fueled triangle, as it is
+	if (MT_Coll_IsTriangle(quad))
+	{
+		COLL_FIXED_QUADBLK_GetNormVecs_NfTri(sps, quad);
+		sps->candidate.triangleID = COLL_QUAD_TRIANGLE_LO_0;
+		COLL_MOVED_TRIANGL_TestPoint(sps, &bsv[0], &bsv[1], &bsv[2]);
+		return;
+	}
+
 	// if 3P or 4P mode,
 	// then use low-LOD quadblock collision (two triangles)
 	if ((sps->Union.QuadBlockColl.searchFlags & COLL_SEARCH_HIGH_LOD) == 0)
@@ -1723,6 +1760,15 @@ void COLL_MOVED_FindScrub(struct QuadBlock *qb, s32 triangleID, struct Scratchpa
 			sps->Input1.scrubDepth = scrub;
 			return;
 		}
+	}
+
+	// MultiTrack: dense Nitro-Fueled meshes can touch more triangles than the
+	// PS1's 15 slots (retail writes past them)
+	if (ext->numTriangles >= (s32)(sizeof(ext->bspSearchTriangle) / sizeof(ext->bspSearchTriangle[0])))
+	{
+		sps->Union.QuadBlockColl.searchFlags = searchFlags & ~COLL_SEARCH_REPEAT_SCRUB;
+		sps->Input1.scrubDepth = 0;
+		return;
 	}
 
 	{

@@ -71,7 +71,9 @@ int RB_Turtle_LInC(struct Instance *inst, struct Thread *driverTh, struct Scratc
 
 	speed = abs(driver->speedApprox);
 
-	if (speed > 0x1400)
+	// MultiTrack: on Nitro-Fueled collision the turtles' pond is slow water all
+	// the way to them; any kart that gets there is bounced
+	if ((speed > 0x1400) || (MT_Coll_On() && (speed > 0x100)))
 	{
 		// small jump
 		jumpType = FORCED_JUMP_LOW;
