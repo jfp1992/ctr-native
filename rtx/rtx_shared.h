@@ -138,7 +138,7 @@ struct RtxSettings
 	uint32_t specular;    // GGX highlights and reflections on every material
 	uint32_t fog;         // height / distance haze and sun shafts
 	uint32_t pipelined;   // renderer a frame behind the game (one frame of latency)
-	uint32_t baked;       // ray tracing "off": the light mode (one sample, cached bounce light, no highlights; an NF track lit from its bake)
+	uint32_t baked;       // ray tracing "off": baked light (a PS1 level from its lightmap, an NF track from its vertex bake)
 };
 
 // renderer pass timings (ms, averaged), RtxHeader.passMs

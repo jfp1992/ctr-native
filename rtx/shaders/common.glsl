@@ -131,7 +131,7 @@ layout(set = 1, binding = 4) uniform sampler2D remTex[1024];
 layout(set = 1, binding = 5) uniform samplerCube remSky;                              // the level's skybox (F.rem.w & 1)
 layout(set = 1, binding = 6, std430) buffer RemGrass { uint remGrass[]; };           // dynamic vertices as wind.comp moved them (grass, animated, proxies): position, normal, tangent (5 words)
 layout(set = 1, binding = 7, std430) readonly buffer RemAnim { uint remAnim[]; };      // moving parts, keys, their vertices, proxy slots (scripts/nf_level.py)
-layout(set = 1, binding = 8, std430) buffer RemBake { vec4 remBake[]; };               // baked mode (F.rem.w & 16): light at each vertex (rembake.comp); F.rem.w & 32: light mode (ray tracing "off": no bounce rays)
+layout(set = 1, binding = 8, std430) buffer RemBake { vec4 remBake[]; };               // baked mode (F.rem.w & 16): light at each vertex (rembake.comp)
 
 const uint INST_LEVEL = 0u;
 const uint INST_DYN = 1u;
