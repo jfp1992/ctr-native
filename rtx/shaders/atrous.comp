@@ -51,6 +51,7 @@ void main()
 	}
 	float lc = luma(c.rgb);
 	float objC = floor(albedoIn[idx].a); // (fraction: debug flags)
+	int view = viewOfPixel(px, F.size.xy); // (split screen: never across views)
 
 	// 3x3 (at this step) of the same object: the light's spread (a young pixel's
 	// variance on the first pass) and the variance blurred (edge stopping)
@@ -61,7 +62,7 @@ void main()
 		{
 			ivec2 q = clamp(px + ivec2(dx, dy) * pc.step, ivec2(0), ivec2(w - 1, h - 1));
 			int qi = q.y * w + q.x;
-			if ((geo[qi].w > 0.0) && (floor(albedoIn[qi].a) == objC))
+			if ((geo[qi].w > 0.0) && (floor(albedoIn[qi].a) == objC) && (viewOfPixel(q, F.size.xy) == view))
 			{
 				vec4 s = src[qi];
 				float l = luma(s.rgb);
@@ -109,7 +110,7 @@ void main()
 			}
 			int qi = q.y * w + q.x;
 			vec4 gq = geo[qi];
-			if ((gq.w <= 0.0) || (floor(albedoIn[qi].a) != objC))
+			if ((gq.w <= 0.0) || (floor(albedoIn[qi].a) != objC) || (viewOfPixel(q, F.size.xy) != view))
 			{
 				continue;
 			}

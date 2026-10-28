@@ -27,12 +27,17 @@ layout(set = 0, binding = 40, std430) readonly buffer SpecPrev { vec4 specPrev[]
 layout(set = 0, binding = 41, std430) writeonly buffer SpecCur { vec4 specCur[]; };
 layout(set = 0, binding = 42, std430) readonly buffer FogPrev { vec4 fogPrev[]; };          // air's light towards the camera, a: 2 x frames + transmittance
 layout(set = 0, binding = 43, std430) writeonly buffer FogCur { vec4 fogCur[]; };
+layout(set = 0, binding = 44, std430) readonly buffer LayerPrev { vec4 layerPrev[]; };      // layer's reflection (linear), a: frames + 16 x view z
+layout(set = 0, binding = 45, std430) writeonly buffer LayerCur { vec4 layerCur[]; };
 
 vec3 shoulder(vec3 x)
 {
 	vec3 over = max(x - 0.8, 0.0);
 	return min(x, vec3(0.8)) + over / (1.0 + over / 0.8);
 }
+
+bool g_secMiss = false; // (shadeSecondary's ray met the sky)
+float g_secT = 1e8;      // (and how far it went)
 
 // radiance leaving a surface hit by a secondary ray (bounce or reflection);
 // fast: a diffuse bounce (g_fastRays: the level opaque to its rays)
@@ -47,6 +52,8 @@ vec3 shadeSecondary(vec3 o, vec3 d, float tmax, bool fast, inout uint rng)
 	g_specOn = false; // (highlights: the camera hit's only)
 	g_risM = fast ? 6 : 16; // bounce light is soft: a few light candidates do
 	float t = traceClosest(o, d, tmax, false, inst, prim, bary);
+	g_secMiss = t < 0.0;
+	g_secT = (t < 0.0) ? 1e8 : t;
 	vec3 result;
 	if (t < 0.0)
 	{
@@ -164,7 +171,7 @@ bool traceCapturedNear(vec3 o, vec3 dir, float t, float eps, bool semi, vec3 ng,
 		return true;
 	}
 	vec3 p = o + dir * t;
-	float reach = 1.5 * t / F.proj.x; // PS1 pixels at that distance
+	float reach = 1.5 * t / V.proj.x; // PS1 pixels at that distance
 	vec3 t1 = normalize(abs(ng.y) < 0.99 ? cross(ng, vec3(0, 1, 0)) : cross(ng, vec3(1, 0, 0)));
 	vec3 t2 = cross(ng, t1);
 	vec3 offs[4] = vec3[4](t1, -t1, t2, -t2);
@@ -178,6 +185,164 @@ bool traceCapturedNear(vec3 o, vec3 dir, float t, float eps, bool semi, vec3 ng,
 		}
 	}
 	return false;
+}
+
+// how far apart a see-through polygon laid over another (the hubs' light
+// layers) may lie at distance t: the pairs are 4-8 units apart, up to ~35
+// (neither quad is flat, and each is split along its own diagonal)
+float decalMargin(float t)
+{
+	return 40.0 + 0.01 * t;
+}
+
+// a see-through level polygon (not water) parallel to the opaque level
+// polygon hit at t and within margin of it, texel showing: its t, -1 none
+float semiOverlayNear(vec3 o, vec3 d, float t, float margin, uint hitPrim, out uint prim, out vec2 bary)
+{
+	prim = 0u;
+	bary = vec2(0.0);
+	if (levelTriBlend(hitPrim) != 3u)
+	{
+		return -1.0;
+	}
+	vec3 nh = triFaceNormal(INST_LEVEL, hitPrim);
+	rayQueryEXT rq;
+	rayQueryInitializeEXT(rq, tlas, gl_RayFlagsNoneEXT, 0x1u, o, max(t - margin, 0.0), d, t + margin);
+	while (rayQueryProceedEXT(rq))
+	{
+		if (rayQueryGetIntersectionTypeEXT(rq, false) == gl_RayQueryCandidateIntersectionTriangleEXT)
+		{
+			uint cp = uint(rayQueryGetIntersectionPrimitiveIndexEXT(rq, false));
+			vec2 cb = rayQueryGetIntersectionBarycentricsEXT(rq, false);
+			if ((cp != hitPrim) && (((levelTris[cp * 3u + 2u] >> 24) & TRI_WATER) == 0u) && (levelTriBlend(cp) != 3u) &&
+			    (abs(dot(triFaceNormal(INST_LEVEL, cp), nh)) > 0.95) && candidateAccept(INST_LEVEL, cp, cb, true))
+			{
+				rayQueryConfirmIntersectionEXT(rq);
+			}
+		}
+	}
+	if (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionTriangleEXT)
+	{
+		return -1.0;
+	}
+	prim = uint(rayQueryGetIntersectionPrimitiveIndexEXT(rq, true));
+	bary = rayQueryGetIntersectionBarycentricsEXT(rq, true);
+	return rayQueryGetIntersectionTEXT(rq, true);
+}
+
+// models (karts, drivers, wheels): the light the level's art has where they
+// are. Much of a level's lamp light is in its vertex colours beyond what the
+// fitted lights explain (fitArt: the level's tint, a lamp pool's colour on the
+// floor and walls); a model gets the tint of the level under it, as a light
+// probe, so it lights up and takes the colour where the floor does
+vec3 modelArtLight(vec3 p)
+{
+	rayQueryEXT rq;
+	rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT, 0x1u, p, 0.0, vec3(0.0, -1.0, 0.0), 600.0);
+	while (rayQueryProceedEXT(rq))
+	{
+	}
+	if (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionTriangleEXT)
+	{
+		return vec3(1.0);
+	}
+	uint lp = uint(rayQueryGetIntersectionPrimitiveIndexEXT(rq, true));
+	vec2 lb = rayQueryGetIntersectionBarycentricsEXT(rq, true);
+	TriData d = fetchTriangle(INST_LEVEL, lp, lb);
+	// its colour, and brighter where the art is brighter; never darker (where the
+	// art is darker than the traced light: painted shade, contact shadows on
+	// the floor, which the model above isn't in)
+	vec3 t = clamp(d.tint.rgb, vec3(0.4), vec3(2.5));
+	float l = luma(t);
+	return (l < 1.0) ? clamp(t / max(l, 0.05), vec3(0.4), vec3(2.5)) : t;
+}
+
+// diagnostics (CTR_RTX_DEBUG "sky leaks"): does the level mesh lie along this
+// ray at all, see-through texels and all
+float g_alongT;
+uint g_alongPrim;
+vec2 g_alongBary;
+bool levelAlong(vec3 o, vec3 d)
+{
+	rayQueryEXT rq;
+	rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT, 0x1u, o, 0.0, d, 1e8);
+	while (rayQueryProceedEXT(rq))
+	{
+	}
+	if (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionTriangleEXT)
+	{
+		return false;
+	}
+	g_alongT = rayQueryGetIntersectionTEXT(rq, true);
+	g_alongPrim = uint(rayQueryGetIntersectionPrimitiveIndexEXT(rq, true));
+	g_alongBary = rayQueryGetIntersectionBarycentricsEXT(rq, true);
+	return true;
+}
+
+// the nearest texel the PS1 drew opaque on this camera ray (texture layer,
+// colour keyed as the PS1 does, this pixel's view), -1 none
+float capOpaqueAlong(vec3 o, vec3 d)
+{
+	rayQueryEXT rq;
+	rayQueryInitializeEXT(rq, tlas, gl_RayFlagsNoneEXT, 0x4u, o, 0.0, d, 1e8);
+	while (rayQueryProceedEXT(rq))
+	{
+		if (rayQueryGetIntersectionTypeEXT(rq, false) == gl_RayQueryCandidateIntersectionTriangleEXT)
+		{
+			if (capturedTexelShows(uint(rayQueryGetIntersectionPrimitiveIndexEXT(rq, false)), rayQueryGetIntersectionBarycentricsEXT(rq, false), false))
+			{
+				rayQueryConfirmIntersectionEXT(rq);
+			}
+		}
+	}
+	return (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionTriangleEXT) ? rayQueryGetIntersectionTEXT(rq, true) : -1.0;
+}
+
+// the level mesh (see-through texels and all, water aside) within slack of t on this ray
+bool levelNear(vec3 o, vec3 d, float t, float slack)
+{
+	rayQueryEXT rq;
+	rayQueryInitializeEXT(rq, tlas, gl_RayFlagsNoneEXT, 0x1u, o, max(t - slack, 0.0), d, t + slack);
+	while (rayQueryProceedEXT(rq))
+	{
+		if (rayQueryGetIntersectionTypeEXT(rq, false) == gl_RayQueryCandidateIntersectionTriangleEXT)
+		{
+			uint cp = uint(rayQueryGetIntersectionPrimitiveIndexEXT(rq, false));
+			if (((levelTris[cp * 3u + 2u] >> 24) & TRI_WATER) == 0u)
+			{
+				rayQueryConfirmIntersectionEXT(rq);
+			}
+		}
+	}
+	if (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionTriangleEXT)
+	{
+		return false;
+	}
+	g_alongT = rayQueryGetIntersectionTEXT(rq, true);
+	g_alongPrim = uint(rayQueryGetIntersectionPrimitiveIndexEXT(rq, true));
+	g_alongBary = rayQueryGetIntersectionBarycentricsEXT(rq, true);
+	return true;
+}
+
+// diagnostics: the PS1's own polygons (texture layer) along this ray
+bool capAlong(vec3 o, vec3 d, out uint prim, out vec2 bary, out float t)
+{
+	rayQueryEXT rq;
+	rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT, 0x4u, o, 0.0, d, 1e8);
+	while (rayQueryProceedEXT(rq))
+	{
+	}
+	prim = 0u;
+	bary = vec2(0.0);
+	t = 0.0;
+	if (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionTriangleEXT)
+	{
+		return false;
+	}
+	prim = uint(rayQueryGetIntersectionPrimitiveIndexEXT(rq, true));
+	bary = rayQueryGetIntersectionBarycentricsEXT(rq, true);
+	t = rayQueryGetIntersectionTEXT(rq, true);
+	return true;
 }
 
 // emitter light (flames, turbos): no history (see below), so at least
@@ -352,11 +517,22 @@ void main()
 			uint blendMode = ls.blend;
 			// water: a rippled mirror; see-through ice: light blue, reflecting the
 			// scene and the sky. Both mixed in by Fresnel (clear looking in, a
-			// mirror at grazing angles). One reflection ray for either
+			// mirror at grazing angles); remaster glass: clear, reflecting 25% (more
+			// at grazing angles), the texture's streaks in its reflection. One
+			// reflection ray for any
 			bool iceLayer = ((ls.flags & TRI_ICE) != 0u) && (F.extra.z != 0u);
 			bool waterLayer = ((ls.flags & TRI_WATER) != 0u) && !iceLayer;
+			bool glassLayer = (ls.flags & TRI_GLASS) != 0u;
 			vec3 refl = vec3(0.0);
-			if (waterLayer || iceLayer)
+			if (glassLayer)
+			{
+				vec3 r = reflect(dir, ls.geoNormal);
+				vec3 reflLin = layerReflection(ls.pos + ls.geoNormal * rayEps(ls.pos), r, ls.pos, dir, idx, rng) * exposure * min(ls.albedo, vec3(1.0));
+				float cosI = clamp(-dot(dir, ls.geoNormal), 0.0, 1.0);
+				col = linearToSrgb(shoulder(reflLin));
+				alpha = min(0.25 + 0.75 * pow(1.0 - cosI, 5.0), 0.9);
+			}
+			else if (waterLayer || iceLayer)
 			{
 				vec3 n = ls.geoNormal;
 				if (waterLayer)
@@ -367,7 +543,7 @@ void main()
 				}
 				vec3 r = reflect(dir, n);
 				r = (dot(r, ls.geoNormal) < 0.0) ? reflect(r, ls.geoNormal) : r;
-				vec3 reflLin = shadeSecondary(ls.pos + ls.geoNormal * rayEps(ls.pos), r, 1e8, false, rng) * exposure * (iceLayer ? ICE_TINT : vec3(1.0));
+				vec3 reflLin = layerReflection(ls.pos + ls.geoNormal * rayEps(ls.pos), r, ls.pos, dir, idx, rng) * exposure * (iceLayer ? ICE_TINT : vec3(1.0));
 				refl = linearToSrgb((waterLayer && (F.extra.z == 0u)) ? clamp(reflLin, 0.0, 1.0) : shoulder(reflLin));
 				float cosI = clamp(-dot(dir, n), 0.0, 1.0);
 				float fresnel = 0.04 + 0.96 * pow(1.0 - cosI, 5.0);
@@ -375,7 +551,9 @@ void main()
 				alpha = iceLayer ? 0.3 + 0.6 * fresnel : clamp(0.55 + 0.4 * fresnel, 0.0, 0.95);
 				blendMode = iceLayer ? 0u : blendMode;
 			}
-			rayO = ls.pos + dir * rayEps(ls.pos);
+			// behind it: from just before it, so the surface it lies on (a unit
+			// or two behind) is found (only opaque polygons count on this ray)
+			rayO = ls.pos - dir * min(decalMargin(t), 0.5 * t); // (never behind the camera)
 			t = traceClosest(rayO, dir, 1e8, false, inst, prim, bary);
 			if ((waterLayer || iceLayer) && (t < 0.0))
 			{
@@ -491,6 +669,11 @@ void main()
 	g_texFilter = true;
 	Surface sf = surfaceAt(inst, prim, bary, dir);
 	g_texFilter = false;
+	if (sf.dynamic && (F.extra.z != 0u) && (F.extra.y == 0u))
+	{
+		sf.albedo = min(sf.albedo * modelArtLight(sf.pos), vec3(0.95));
+	}
+	g_skipLayers = true; // (from here: this surface's shadow and bounce rays)
 	bool capMiss = false; // level pixel without the PS1's polygon (debug view 5; or past its near textures)
 	if (inst == INST_LEVEL)
 	{
@@ -509,8 +692,8 @@ void main()
 		// past its near texture distance the PS1 draws lower textures: the mesh's
 		// own (near) texels there, not the texture layer (or they'd sharpen as
 		// the kart gets close: pop-in)
-		float hitViewZ = dot(F.camR[2].xyz, sf.pos) + F.camT.z;
-		bool nearTextures = (F.params2.w <= 0.0) || (hitViewZ < F.params2.w);
+		float hitViewZ = dot(V.camR[2].xyz, sf.pos) + V.camT.z;
+		bool nearTextures = (V.misc.x <= 0.0) || (hitViewZ < V.misc.x);
 		capMiss = !nearTextures || !traceCapturedNear(o, dir, tc, max(8.0, 0.03 * tc), false, sf.geoNormal, cprim, cbary);
 		if (!capMiss)
 		{
@@ -787,6 +970,12 @@ void main()
 		{
 			cacheAdd(p, n, indirectSum / float(spp));
 		}
+		// remaster emission maps: shown as drawn (demodulated: final multiplies by albedo x exposure).
+		// With the emitter light, which keeps no history: emission maps animate (Oxide
+		// Station's floor lights run along), and 64 frames of history would smear
+		// them everywhere but round the kart (its rays' pixels keep one frame: a
+		// sharp-edged bubble of the right light following it)
+		dynLight += sf.emission / max(sf.albedo, vec3(0.05)) / max(exposure, 1e-3);
 		// glowing surfaces show as the PS1 draws them (on top of the light they receive)
 		if (((sf.flags & TRI_EMISSIVE) != 0u) && (sf.blend == 3u))
 		{
@@ -886,7 +1075,7 @@ void main()
 	specCur[idx] = specH;
 
 	// temporal accumulation
-	float viewZ = dot(F.camR[2].xyz, p) + F.camT.z;
+	float viewZ = dot(V.camR[2].xyz, p) + V.camT.z;
 	// emitter light keeps no history: its lights move with the karts, and last
 	// frame's light pool (with the kart's shadow cut out of it) would trail behind
 	// as a bright kart-shaped ghost

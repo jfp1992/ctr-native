@@ -25,12 +25,17 @@ void main()
 	float sigma = max(float(h) / 100.0, 2.0);
 	int taps = min(int(ceil(sigma * 2.5)), 48);
 	ivec2 axis = (pc.step == 0) ? ivec2(1, 0) : ivec2(0, 1);
+	int view = viewOfPixel(px, F.size.xy); // (split screen: glow stays in its view)
 	vec3 sum = vec3(0.0);
 	float wsum = 0.0;
 	for (int i = -taps; i <= taps; i++)
 	{
 		float x = float(i);
 		ivec2 q = clamp(px + axis * i, ivec2(0), ivec2(w - 1, h - 1));
+		if ((F.outSize.w > 1u) && (viewOfPixel(q, F.size.xy) != view))
+		{
+			continue;
+		}
 		float k = exp(-0.5 * x * x / (sigma * sigma));
 		sum += min(src[q.y * w + q.x].rgb, vec3(2.0)) * k; // capped: single hot pixels don't flare
 		wsum += k;
@@ -47,5 +52,5 @@ void main()
 	{
 		return; // the sky is composited under the image later: adding here would darken it
 	}
-	disp[idx] = vec4(clamp(linearToSrgb(srgbToLinear(c.rgb) + sum * 0.5), 0.0, 1.0), c.a);
+	disp[idx] = vec4(clamp(linearToSrgb(srgbToLinear(c.rgb) + sum * 0.4), 0.0, 1.0), c.a);
 }

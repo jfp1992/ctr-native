@@ -161,6 +161,8 @@ enum
 	B_SPEC_CUR,
 	B_FOG_PREV,   // air's light (haze, sun shafts), accumulated
 	B_FOG_CUR,
+	B_LAYER_PREV, // see-through layer's reflection, its own short history
+	B_LAYER_CUR,
 	B_COUNT
 };
 
@@ -285,18 +287,20 @@ static struct
 
 	// per pixel: traced at inW x inH (RtxSettings.renderScale), resolved by TAA onto outW x outH
 	uint32_t outW, outH, inW, inH;
-	Buf disp, taaHist[2], blueNoise, spec[2], fog[2];
+	Buf disp, taaHist[2], blueNoise, spec[2], fog[2], layerHist[2];
 	Buf albedo, geo[2], hist[2], histDyn[2], moments[2], reservoir[2], combined, filterA, filterB, layer, out, readback, depth, depthReadback;
 	uint32_t parity;
 	uint32_t frameIndex;
 
 	// lighting
 	struct RtxLighting light;
-	float prevR[9], prevT[3], prevH, prevCamPos[3];
+	float prevR[RTX_MAX_VIEWS][9], prevT[RTX_MAX_VIEWS][3], prevH[RTX_MAX_VIEWS], prevCamPos[RTX_MAX_VIEWS][3];
+	uint32_t prevNumViews;
 	int havePrev;
 	uint32_t lastGameFrame;
 	uint32_t lastLightMode;
 	float autoExposure;
+	float modelGain; // models' brightness against the level's, as the PS1 shows them (smoothed, 0: not yet)
 
 	// samples per pixel: the quality preset's, lowered when the trace pass would
 	// take longer than its budget (RtxSettings)
@@ -573,7 +577,7 @@ static void initVulkan(void)
 		VkQueryPoolCreateInfo qci2 = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, .queryType = VK_QUERY_TYPE_TIMESTAMP, .queryCount = TS_COUNT};
 		CHECK(vkCreateQueryPool(R.dev, &qci2, NULL, &R.timestamps));
 	}
-	R.budgetMs = 28.0f; // until the game's settings arrive (RtxSettings.budgetMs)
+	R.budgetMs = 0.0f; // until the game's settings arrive (RtxSettings.budgetMs)
 	R.spp = 2;
 }
 
@@ -3894,6 +3898,7 @@ static void resize(uint32_t inW, uint32_t inH, uint32_t w, uint32_t h)
 		vkCmdFillBuffer(R.cmd, R.taaHist[i].buf, 0, VK_WHOLE_SIZE, 0);
 		vkCmdFillBuffer(R.cmd, R.spec[i].buf, 0, VK_WHOLE_SIZE, 0);
 		vkCmdFillBuffer(R.cmd, R.fog[i].buf, 0, VK_WHOLE_SIZE, 0);
+		vkCmdFillBuffer(R.cmd, R.layerHist[i].buf, 0, VK_WHOLE_SIZE, 0);
 	}
 	cmdSubmitWait();
 	R.outW = w;
@@ -3941,7 +3946,7 @@ static void writeSets(void)
 			                   &R.cacheKeys, &R.cacheAccum, &R.cacheVal, &R.lightGrid, &R.fit, &R.capTris,
 			                   &R.histDyn[par ^ 1], &R.histDyn[par], &R.combined, &R.bake, &R.levelTint, &R.moments[par ^ 1], &R.moments[par], &R.reservoir[par ^ 1], &R.reservoir[par],
 			                   &R.disp, &R.taaHist[par ^ 1], &R.taaHist[par], &R.blueNoise, &R.spec[par ^ 1], &R.spec[par],
-			                   &R.fog[par ^ 1], &R.fog[par]};
+			                   &R.fog[par ^ 1], &R.fog[par], &R.layerHist[par ^ 1], &R.layerHist[par]};
 			VkDescriptorBufferInfo infos[B_COUNT];
 			VkWriteDescriptorSet w[B_COUNT];
 			VkWriteDescriptorSetAccelerationStructureKHR asw = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR, .accelerationStructureCount = 1,
@@ -4762,11 +4767,10 @@ static void renderFrame(void)
 		}
 	}
 
-	// next frame's samples per pixel: the quality preset's, fewer if the trace
-	// pass would overrun its budget
-	static const uint32_t presetSpp[4] = {2, 4, 8, 16};
-	uint32_t preset = presetSpp[H->settings.quality & 3u];
-	R.budgetMs = (H->settings.budgetMs > 0.0f) ? H->settings.budgetMs : R.budgetMs;
+	// next frame's samples per pixel: the settings' (Settings menu, F12 overlay),
+	// fewer if the trace pass would overrun its budget (budget 0: off)
+	uint32_t preset = H->settings.spp < 1u ? 1u : (H->settings.spp > RTX_MAX_SPP ? RTX_MAX_SPP : H->settings.spp);
+	R.budgetMs = H->settings.budgetMs;
 	if (!R.haveTimestamps)
 	{
 		R.spp = preset;
@@ -4807,7 +4811,7 @@ static void renderFrame(void)
 				R.statFrames = 0;
 			}
 			R.traceMsPerSpp = (R.traceMsPerSpp > 0.0f) ? 0.8f * R.traceMsPerSpp + 0.2f * per : per;
-			float want = R.budgetMs / R.traceMsPerSpp;
+			float want = (R.budgetMs > 0.0f) ? R.budgetMs / R.traceMsPerSpp : (float)preset;
 			uint32_t next = (uint32_t)fmaxf(1.0f, fminf((float)preset, floorf(want)));
 			// change gradually: no visible pumping
 			if (next > R.spp * 2)

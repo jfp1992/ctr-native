@@ -92,8 +92,15 @@ void main()
 			hdr = hdr * T + fog.rgb * exposure;
 			color = linearToSrgb(shoulder(hdr));
 			// glowing surfaces bloom; so does light far over white
-			glow = (a.a > 2.5) ? hdr * 0.5 : max(hdr - vec3(1.2), vec3(0.0)) * 0.5;
+			glow = (a.a > 2.5) ? hdr * 0.3 : max(hdr - vec3(1.5), vec3(0.0)) * 0.4;
 		}
+		alpha = 1.0;
+	}
+	else if (((F.rem.w & 1u) != 0u) && (view == 0u))
+	{
+		// nothing hit: the Nitro-Fueled skybox (display colours, as the game draws it)
+		vec2 off = (F.outSize.z != 0u) ? F.jitter.xy : vec2(0.5);
+		color = textureLod(remSky, cameraRayDir(vec2(px) + off), 0.0).rgb;
 		alpha = 1.0;
 	}
 
@@ -110,7 +117,7 @@ void main()
 			else if (blend == 1u)
 			{
 				color += layer.rgb;
-				glow += srgbToLinear(layer.rgb) * 0.4; // additive glows bloom
+				glow += srgbToLinear(layer.rgb) * 0.25; // additive glows bloom
 			}
 			else if (blend == 2u)
 			{
