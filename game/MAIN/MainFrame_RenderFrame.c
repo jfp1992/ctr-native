@@ -519,6 +519,7 @@ void RenderAllHUD(struct GameTracker *gGT)
 	// MultiTrack: track select screenshots (scripts/track_shots.py) show no HUD
 	MT_ShotTick();
 	MT_Coll_Tick(); // MultiTrack: NF portals
+	MT_LightBakeTick(); // MultiTrack: "BAKING LIGHT" while the level's lightmap bakes
 	if (MT_ShotClean())
 	{
 		return;

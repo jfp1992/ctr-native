@@ -2,6 +2,7 @@
 #include <multitrack.h>
 #include "platform/native_assets.h"
 #include "platform/native_renderer.h"
+#include "platform/native_rtx.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -103,6 +104,20 @@ int MT_ShotClean(void)
 		s_clean = (v != NULL) && (atoi(v) != 0);
 	}
 	return s_clean;
+}
+
+// once a frame (RenderAllHUD): with ray tracing off, while the level's light
+// bakes (the game standing still), how far it is
+void MT_LightBakeTick(void)
+{
+	int pct = Rtx_LightmapBakeProgress();
+	if (pct < 0)
+	{
+		return;
+	}
+	char buf[32];
+	snprintf(buf, sizeof(buf), "BAKING LIGHT %d%%", pct);
+	DecalFont_DrawLine(buf, 256, 100, FONT_BIG, JUSTIFY_CENTER | ORANGE);
 }
 
 // once a frame (RenderAllHUD): the intro fly-by over (the race HUD would

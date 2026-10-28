@@ -265,6 +265,8 @@ static struct RtxTexSlot *Rtx_TexSlots(void) { return (struct RtxTexSlot *)(s_rt
 static struct RtxDynTri *Rtx_DynTris(void) { return (struct RtxDynTri *)(s_rtx.base + RTX_OFF_DYN_TRIS); }
 
 static void Rtx_InitSettings(void);
+static void Rtx_LightmapFreeze(void);
+static int Rtx_BakeStaticInst(const struct Instance *inst);
 
 // the renderer draws whenever it runs: ray tracing off is its baked mode
 // (RtxSettings.baked: a PS1 level lit from its lightmap, a Nitro-Fueled track
@@ -651,6 +653,7 @@ void Rtx_FrameBegin(void)
 	s_rtx.calZ = s_rtx.calB = 0.0;
 	s_rtx.calN = 0;
 	s_rtx.worldCapture = (RTX_HDR != NULL) && Rtx_Drawing() && RTX_HDR->rendererReady;
+	Rtx_LightmapFreeze();
 	s_rtx.statCaptured = s_rtx.statNoProj = s_rtx.statSemi = s_rtx.statInstances = s_rtx.statCulledTris = 0;
 	s_rtx.capSerial = 0;
 	s_rtx.instScale = 1.0f;
@@ -822,6 +825,13 @@ void Rtx_EndTag(struct PrimMem *primMem)
 				}
 			}
 			p += 1 + len;
+		}
+		if (Rtx_BakeStaticInst(s_rtx.emitInst))
+		{
+			for (int i = dynStart; i < s_rtx.numDyn; i++)
+			{
+				Rtx_DynTris()[i].flags |= RTX_TRI_BAKE_STATIC;
+			}
 		}
 		if ((kart != NULL) && (s_rtx.numKartBody < 16))
 		{
@@ -1002,6 +1012,13 @@ static int Rtx_IsLevelInstance(const void *inst)
 		}
 	}
 	return 0;
+}
+
+// a level object that never moves (no thread: no logic, no animation): the
+// lightmap bake takes its shadow and its glows (RTX_TRI_BAKE_STATIC)
+static int Rtx_BakeStaticInst(const struct Instance *inst)
+{
+	return (inst != NULL) && (inst->thread == NULL) && Rtx_IsLevelInstance(inst);
 }
 
 // whether a model instance was drawn this frame (in any view)
@@ -2568,6 +2585,56 @@ static int Rtx_LevelTraced(struct GameTracker *gGT)
 	return (gGT->levelID <= CITADEL_CITY) && ((gGT->gameMode1 & (MAIN_MENU | GAME_CUTSCENE)) == 0);
 }
 
+// ray tracing off: while the renderer bakes the level's lightmap the game
+// stands still, so the light settles on a scene that doesn't move (PAUSE_2, an
+// unused debug pause: drivers, threads, particles and sound stop, the scene is
+// still drawn; no pause menu meanwhile)
+static void Rtx_LightmapFreeze(void)
+{
+	static int s_frozen;
+	struct GameTracker *gGT = sdata->gGT;
+	int bake = (RTX_HDR != NULL) && RTX_HDR->rendererReady && !s_rtx.enabled && (RTX_HDR->lmState == RTX_LM_BAKING) && (gGT != NULL) &&
+	           (sdata->Loading.stage == LOAD_IDLE) && (gGT->levelID <= CITADEL_CITY) && ((gGT->gameMode1 & (MAIN_MENU | GAME_CUTSCENE)) == 0);
+	if (bake)
+	{
+		if (!s_frozen)
+		{
+			gGT->gameMode1 |= PAUSE_2;
+			MainFrame_TogglePauseAudio(1);
+			s_frozen = 1;
+			printf("[RTX] baking the level's light: the game stands still\n");
+		}
+		gGT->cooldownfromPauseUntilUnpause = 2; // (Start doesn't "unpause" it)
+	}
+	else if (s_frozen)
+	{
+		if (gGT != NULL)
+		{
+			gGT->gameMode1 &= ~PAUSE_2;
+			gGT->cooldownfromPauseUntilUnpause = 0;
+			MainFrame_TogglePauseAudio(0);
+		}
+		s_frozen = 0;
+		printf("[RTX] the level's light is baked\n");
+	}
+}
+
+// Settings: progress of the level's lightmap bake (-1: not baking)
+int Rtx_LightmapBakeProgress(void)
+{
+	return ((RTX_HDR != NULL) && RTX_HDR->rendererReady && !s_rtx.enabled && (RTX_HDR->lmState == RTX_LM_BAKING)) ? (int)RTX_HDR->lmProgress : -1;
+}
+
+// Settings "Rebake light": every level's lightmap is baked again (the renderer
+// deletes them; the level loaded now starts again)
+void Rtx_LightmapRebake(void)
+{
+	if (RTX_HDR != NULL)
+	{
+		RTX_HDR->lmRebake++;
+	}
+}
+
 void Rtx_OnLevelCamera(struct PushBuffer *pb)
 {
 	struct GameTracker *gGT = sdata->gGT;
@@ -3444,6 +3511,7 @@ static int Rtx_RememberLights(const struct RtxPointLight *cur, const void *const
 		memcpy(l->color, r->color, sizeof(l->color));
 		l->falloff = r->falloff;
 		l->size = r->size;
+		l->pad[0] = (!r->inst || Rtx_BakeStaticInst(r->inst)) ? 1.0f : 0.0f; // (stays: in the lightmap bake)
 	}
 
 	// the strongest at the camera first

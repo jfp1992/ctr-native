@@ -210,7 +210,8 @@ static void MT_Settings_ValueText(int row, char *buf, int size)
 
 static int MT_Settings_RowLocked(int row)
 {
-	return ((row == MT_ROW_RTX) || (row == MT_ROW_SPP)) && !Rtx_Supported();
+	// (a ray tracing GPU never draws with the GL bake: ray tracing off is the lightmap)
+	return (((row == MT_ROW_RTX) || (row == MT_ROW_SPP)) && !Rtx_Supported()) || ((row == MT_ROW_BAKED) && Rtx_Supported());
 }
 
 static void MT_Settings_DrawPanel(struct GameTracker *gGT)
@@ -231,7 +232,7 @@ static void MT_Settings_DrawPanel(struct GameTracker *gGT)
 		int ry = y + titleH + i * rowH + 2;
 		int color = MT_Settings_RowLocked(i) ? 0x17 : ORANGE;
 		MT_Settings_ValueText(i, value, sizeof(value));
-		DecalFont_DrawLine(labels[i], x + 8, ry, FONT_BIG, color);
+		DecalFont_DrawLine(((i == MT_ROW_BAKE_NOW) && Rtx_Supported()) ? "REBAKE LIGHT" : labels[i], x + 8, ry, FONT_BIG, color);
 		// (a resolution picked but not applied yet: in white)
 		int pending = (i == MT_ROW_RESOLUTION) && (s_mtSet.pendingMode != MT_Settings_CurrentMode());
 		DecalFont_DrawLine(value, x + MT_SET_PANEL_W - 8, ry, FONT_BIG, JUSTIFY_RIGHT | (pending ? WHITE : color));
@@ -282,6 +283,13 @@ static void MT_Settings_DrawMessage(struct GameTracker *gGT, char **lines, int n
 
 static void MT_Settings_DrawConfirm(struct GameTracker *gGT)
 {
+	if (Rtx_Supported())
+	{
+		char *rebake[] = {"BAKE THE LIGHT AGAIN", "WITH RAY TRACING OFF EVERY LEVEL", "BAKES ITS LIGHT AGAIN", "THE NEXT TIME IT LOADS."};
+		char *choices[] = {"NO", "YES"};
+		MT_Settings_DrawMessage(gGT, rebake, 4, choices, 2, s_mtSet.confirmYes);
+		return;
+	}
 	char *lines[] = {"BAKE RAY TRACED LIGHTING", "FOR EVERY LEVEL NOT BAKED YET.", "THIS CAN TAKE A LONG TIME",
 	                 Rtx_Supported() ? "(ON THIS GPU: SOME MINUTES)" : "(NO RAY TRACING GPU: HOURS)", "BACK STOPS IT AFTER A LEVEL."};
 	char *choices[] = {"NO", "YES"};
@@ -397,7 +405,13 @@ static void MT_Settings_ConfirmInput(int tap)
 	else if (tap & (BTN_CROSS_one | BTN_CIRCLE))
 	{
 		OtherFX_Play(1, 1);
-		if (s_mtSet.confirmYes)
+		if (s_mtSet.confirmYes && Rtx_Supported())
+		{
+			Rtx_LightmapRebake();
+			s_mtSet.bakeTotal = 1;
+			s_mtSet.focus = MT_SET_PANEL;
+		}
+		else if (s_mtSet.confirmYes)
 		{
 			Rtx_BakeStart();
 			s_mtSet.focus = Rtx_BakeRunning() ? MT_SET_BAKING : MT_SET_PANEL;

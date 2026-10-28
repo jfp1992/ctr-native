@@ -78,6 +78,7 @@ int MT_BootLevel(int defaultLevel);
 // written once the race-start camera has settled
 int MT_ShotClean(void);
 void MT_ShotTick(void);
+void MT_LightBakeTick(void);
 struct GameTracker;
 void MT_Settings_Tick(struct GameTracker *gGT); // main menu Settings (MT_Settings.c), before the menu's input
 int MT_Settings_HidesMenu(void);                // Settings open: no menu under it this frame

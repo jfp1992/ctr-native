@@ -53,6 +53,10 @@ int Rtx_BakeRunning(void);
 void Rtx_BakeProgress(int *done, int *total, const char **name);
 void Rtx_BakeShutdown(void);
 
+// ray tracing off: the level lit from its lightmap, baked by the renderer
+int Rtx_LightmapBakeProgress(void); // 0..100 while the level's bakes (the game stands still), -1 not baking
+void Rtx_LightmapRebake(void);      // every level's again
+
 // game hooks
 void Rtx_FrameBegin(void);
 void Rtx_BeginTag(int tag, struct PrimMem *primMem);
