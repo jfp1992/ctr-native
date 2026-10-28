@@ -338,24 +338,112 @@ static int Rtx_EnvInt(const char *name, int fallback)
 }
 
 // renderer settings: defaults (the user's preferred set, native/preferred-defaults.png),
-// CTR_RTX_* env vars override (F12 overlay changes them live)
+// then settings.ini (main menu Settings / F12 overlay), CTR_RTX_* env vars override
+static int Rtx_Setting(const char *env, const char *key, int fallback)
+{
+	return Rtx_EnvInt(env, NativeSettings_GetInt(key, fallback));
+}
+
+static u32 Rtx_ClampSpp(int spp)
+{
+	spp = (spp + (int)RTX_SPP_STEP / 2) / (int)RTX_SPP_STEP * (int)RTX_SPP_STEP;
+	return (u32)((spp < (int)RTX_MIN_SPP) ? (int)RTX_MIN_SPP : ((spp > (int)RTX_MAX_SPP) ? (int)RTX_MAX_SPP : spp));
+}
+
 static void Rtx_InitSettings(void)
 {
 	struct RtxSettings *S = &s_rtx.settings;
-	S->renderScale = (u32)Rtx_EnvInt("CTR_RTX_SCALE", 67);
+	S->renderScale = (u32)Rtx_Setting("CTR_RTX_SCALE", "rtx_scale", 67);
 	S->renderScale = S->renderScale < 25 ? 25 : (S->renderScale > 100 ? 100 : S->renderScale);
-	S->quality = (u32)Rtx_EnvInt("CTR_RTX_QUALITY", 1) & 3u;
+	S->spp = Rtx_ClampSpp(Rtx_Setting("CTR_RTX_SPP", "rtx_spp", 4));
 	const char *budget = SDL_getenv("CTR_RTX_BUDGET_MS");
-	S->budgetMs = budget ? (float)atof(budget) : 28.0f;
-	S->taa = Rtx_EnvInt("CTR_RTX_TAA", 1) != 0;
-	S->texFilter = Rtx_EnvInt("CTR_RTX_TEXFILTER", 1) != 0;
-	S->specular = Rtx_EnvInt("CTR_RTX_SPEC", 1) != 0;
-	S->fog = Rtx_EnvInt("CTR_RTX_FOG", 0) != 0;
-	S->pipelined = Rtx_EnvInt("CTR_RTX_PIPELINE", 1) != 0;
+	S->budgetMs = budget ? (float)atof(budget) : (float)NativeSettings_GetInt("rtx_budget", 0);
+	S->taa = Rtx_Setting("CTR_RTX_TAA", "rtx_taa", 1) != 0;
+	S->texFilter = Rtx_Setting("CTR_RTX_TEXFILTER", "rtx_texfilter", 1) != 0;
+	S->specular = Rtx_Setting("CTR_RTX_SPEC", "rtx_spec", 1) != 0;
+	S->fog = Rtx_Setting("CTR_RTX_FOG", "rtx_fog", 0) != 0;
+	S->pipelined = Rtx_Setting("CTR_RTX_PIPELINE", "rtx_pipeline", 1) != 0;
+}
+
+// settings.ini gets what the overlay / menu / F7 changed
+static void Rtx_SaveSettings(void)
+{
+	const struct RtxSettings *S = &s_rtx.settings;
+	NativeSettings_SetInt("rtx", s_rtx.enabled);
+	NativeSettings_SetInt("rtx_scale", (int)S->renderScale);
+	NativeSettings_SetInt("rtx_spp", (int)S->spp);
+	NativeSettings_SetInt("rtx_budget", (int)(S->budgetMs + 0.5f));
+	NativeSettings_SetInt("rtx_taa", (int)S->taa);
+	NativeSettings_SetInt("rtx_texfilter", (int)S->texFilter);
+	NativeSettings_SetInt("rtx_spec", (int)S->specular);
+	NativeSettings_SetInt("rtx_fog", (int)S->fog);
+	NativeSettings_SetInt("rtx_pipeline", (int)S->pipelined);
+	NativeSettings_Save();
+}
+
+static int Rtx_RendererExited(void);
+
+// the renderer can trace: started and still running (it exits at once when
+// the GPU has no ray queries)
+int Rtx_Supported(void)
+{
+	if ((RTX_HDR == NULL) || (s_rtx.rendererPid <= 0))
+	{
+		return 0;
+	}
+	return !Rtx_RendererExited();
+}
+
+// whether the renderer process has exited (logged once); one that ran (was
+// ready) is started again, a few times a session, and the level uploaded anew
+// (one that never got ready: no ray tracing GPU, it stays off)
+static int Rtx_RendererExited(void)
+{
+	static int s_restarts;
+	int status;
+	if ((s_rtx.rendererPid <= 0) || (waitpid(s_rtx.rendererPid, &status, WNOHANG) != s_rtx.rendererPid))
+	{
+		return s_rtx.rendererPid <= 0;
+	}
+	int ran = RTX_HDR->rendererReady || s_rtx.rendererRan;
+	printf("[RTX] renderer exited (%s %d)%s\n", WIFEXITED(status) ? "code" : "signal", WIFEXITED(status) ? WEXITSTATUS(status) : WTERMSIG(status),
+	       (ran && s_restarts < 3) ? ", starting it again" : ": no ray tracing");
+	s_rtx.rendererPid = -1;
+	RTX_HDR->rendererReady = 0;
+	s_rtx.levelValid = 0;
+	s_rtx.rendererRan = ran;
+	if (ran && (s_restarts < 3))
+	{
+		s_restarts++;
+		Rtx_SpawnRenderer();
+	}
+	return s_rtx.rendererPid <= 0;
+}
+
+int Rtx_Enabled(void)
+{
+	return s_rtx.enabled;
+}
+
+void Rtx_SetEnabled(int on)
+{
+	s_rtx.enabled = on != 0;
+	printf("[RTX] ray tracing %s\n", s_rtx.enabled ? "on" : "off");
+	Rtx_SaveSettings();
+}
+
+int Rtx_GetSpp(void)
+{
+	return (int)s_rtx.settings.spp;
+}
+
+void Rtx_SetSpp(int spp)
+{
+	s_rtx.settings.spp = Rtx_ClampSpp(spp);
+	Rtx_SaveSettings();
 }
 
 static const char *s_rtxViewNames[] = {"final", "albedo", "normal", "direct", "indirect", "texture layer misses (red)", "sun x shadow", "sun, smooth normals"};
-static const char *s_rtxQualityNames[] = {"low (2 spp)", "medium (4 spp)", "high (8 spp)", "ultra (16 spp)"};
 
 const char *Rtx_KeyStatus(int scancode)
 {
@@ -370,7 +458,7 @@ const char *Rtx_KeyStatus(int scancode)
 	case SDL_SCANCODE_F6:
 		return s_rtxViewNames[s_rtx.debugView & 7];
 	case SDL_SCANCODE_F7:
-		return s_rtx.enabled ? (RTX_HDR->rendererReady ? "on" : "on (renderer not ready)") : "off";
+		return !Rtx_Supported() ? "not supported (no ray tracing GPU)" : (s_rtx.enabled ? (RTX_HDR->rendererReady ? "on" : "on (renderer not ready)") : "off");
 	}
 	return "";
 }
@@ -384,23 +472,32 @@ int Rtx_OverlayText(char *buf, int size)
 	}
 	const struct RtxSettings *S = &s_rtx.settings;
 	const float *ms = RTX_HDR->passMs;
+	char budgetText[24];
+	if (S->budgetMs > 0.0f)
+	{
+		snprintf(budgetText, sizeof(budgetText), "%.0f ms", S->budgetMs);
+	}
+	else
+	{
+		snprintf(budgetText, sizeof(budgetText), "off");
+	}
 	return snprintf(buf, size,
 	                "-- ray tracing: keys 1-8 change, Shift+key back --\n"
 	                "1 render scale    %u%% (%ux%u -> %ux%u)\n"
-	                "2 quality         %s, now %u spp\n"
+	                "2 samples         %u spp, now %u\n"
 	                "3 TAA             %s\n"
 	                "4 texture filter  %s\n"
 	                "5 specular        %s\n"
 	                "6 fog / shafts    %s\n"
 	                "7 pipelined       %s\n"
-	                "8 trace budget    %.0f ms\n"
+	                "8 trace budget    %s\n"
 	                "-- renderer --\n"
 	                "GPU %5.2f ms  CPU %5.2f ms  frame %5.2f ms\n"
 	                " build %.2f  trace %.2f  cache %.2f\n"
 	                " a-trous %.2f  final %.2f  copy %.2f\n",
-	                S->renderScale, RTX_HDR->inW, RTX_HDR->inH, RTX_HDR->outW, RTX_HDR->outH, s_rtxQualityNames[S->quality & 3], RTX_HDR->traceSpp,
+	                S->renderScale, RTX_HDR->inW, RTX_HDR->inH, RTX_HDR->outW, RTX_HDR->outH, S->spp, RTX_HDR->traceSpp,
 	                S->taa ? "on" : "off", S->texFilter ? "bilinear" : "nearest (PS1)", S->specular ? "on" : "off", S->fog ? "on" : "off",
-	                S->pipelined ? "on (+1 frame latency)" : "off", S->budgetMs, ms[RTX_PASS_GPU], ms[RTX_PASS_CPU], RTX_HDR->renderMs,
+	                S->pipelined ? "on (+1 frame latency)" : "off", budgetText, ms[RTX_PASS_GPU], ms[RTX_PASS_CPU], RTX_HDR->renderMs,
 	                ms[RTX_PASS_BUILD], ms[RTX_PASS_TRACE], ms[RTX_PASS_CACHE], ms[RTX_PASS_ATROUS], ms[RTX_PASS_FINAL], ms[RTX_PASS_COPY]);
 }
 
@@ -410,7 +507,8 @@ void Rtx_OverlayKey(int digit, int back)
 	struct RtxSettings *S = &s_rtx.settings;
 	int dir = back ? -1 : 1;
 	static const u32 scales[] = {50, 67, 75, 100};
-	static const float budgets[] = {8.0f, 10.0f, 14.0f, 18.0f, 22.0f, 28.0f};
+	static const float budgets[] = {0.0f, 8.0f, 10.0f, 14.0f, 18.0f, 22.0f, 28.0f, 33.0f, 50.0f}; // (0: off)
+	const int numBudgets = (int)(sizeof(budgets) / sizeof(budgets[0]));
 	switch (digit)
 	{
 	case 1:
@@ -425,7 +523,8 @@ void Rtx_OverlayKey(int digit, int back)
 		break;
 	}
 	case 2:
-		S->quality = (S->quality + (u32)(dir + 4)) & 3u;
+		S->spp = (S->spp == RTX_MAX_SPP && dir > 0) ? RTX_MIN_SPP
+		         : ((S->spp == RTX_MIN_SPP && dir < 0) ? RTX_MAX_SPP : Rtx_ClampSpp((int)S->spp + dir * (int)RTX_SPP_STEP));
 		break;
 	case 3:
 		S->taa ^= 1;
@@ -3729,7 +3828,9 @@ int Rtx_RenderFrame(int outW, int outH, const u8 **rgba, const float **depth)
 		// after it still comes, so 250 ms from when it was last seen busy)
 		u64 now = SDL_GetTicksNS(), waited = now - start;
 		lastBusy = RTX_HDR->rendererBusy ? now : lastBusy;
-		if (((now - lastBusy) > 250000000ull) || (waited > 15000000000ull))
+		// (64 spp at 4K takes its time: the wait grows with the samples)
+		u64 frameLimit = 250000000ull + 20000000ull * s_rtx.settings.spp;
+		if (((now - lastBusy) > frameLimit) || (waited > 15000000000ull))
 		{
 			static int warned;
 			if (!warned++)
