@@ -518,6 +518,7 @@ void RenderAllHUD(struct GameTracker *gGT)
 
 	// MultiTrack: track select screenshots (scripts/track_shots.py) show no HUD
 	MT_ShotTick();
+	MT_Coll_Tick(); // MultiTrack: NF portals
 	if (MT_ShotClean())
 	{
 		return;

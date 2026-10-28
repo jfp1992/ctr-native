@@ -53,6 +53,8 @@ static struct
 	struct BSP **stack;
 	u32 stackSize;
 	struct NavHeader *navTable[3]; // (a native track's Level.LevNavTable)
+	s16 warps[8][8];               // portals: entry xyz, exit xyz, exit yaw, radius
+	u32 numWarps;
 } s_mtColl;
 
 // a native track's end of race cameras: none (ST1_CAMERA_EOR: an empty list)
@@ -85,7 +87,8 @@ static int MT_Coll_Key(char *key, size_t size)
 // a native track's race section (scripts/nf_collision.py race_bytes, each part
 // 4 aligned): u32 8, s16 DriverSpawn[8][6]; u32 n, CheckpointNode[n]; u32 paths,
 // per path u32 frames, NavHeader, NavFrame[frames]; u32 moves, per move u32
-// InstDef offset in the level body, s16 pos[3], s16 0. Checked whole before
+// InstDef offset in the level body, s16 pos[3], s16 0; (optional) u32 n,
+// portals: s16 entry[3], exit[3], exit yaw, radius. Checked whole before
 // anything is changed; 0 if unusable.
 static int MT_Coll_ApplyRace(struct Level *lev, u8 *race, u32 size, u32 bodySize)
 {
@@ -159,6 +162,17 @@ static int MT_Coll_ApplyRace(struct Level *lev, u8 *race, u32 size, u32 bodySize
 		if ((u64)off + sizeof(struct InstDef) > bodySize)
 			return 0;
 	}
+	at += numMoves * 12;
+	u32 numWarps = 0;
+	s16 *warps = NULL;
+	if ((u64)at + 4 <= (u64)size)
+	{
+		MT_RACE_U32(numWarps);
+		MT_RACE_NEED(numWarps * 16);
+		if (numWarps > 8)
+			return 0;
+		warps = (s16 *)(race + at);
+	}
 #undef MT_RACE_NEED
 #undef MT_RACE_U32
 #undef MT_RACE_ALIGN
@@ -209,9 +223,12 @@ static int MT_Coll_ApplyRace(struct Level *lev, u8 *race, u32 size, u32 bodySize
 	}
 	lev->numSpawnType2 = 0;
 	lev->numSpawnType2_PosRot = 0;
-	printf("[MultiTrack] native NF track: %u restart points (track length %u), nav paths %d / %d / %d frames, %u instances moved\n", numNodes,
+	s_mtColl.numWarps = numWarps;
+	if (numWarps > 0)
+		memcpy(s_mtColl.warps, warps, numWarps * 16);
+	printf("[MultiTrack] native NF track: %u restart points (track length %u), nav paths %d / %d / %d frames, %u instances moved, %u portals\n", numNodes,
 	       (u32)nodes[0].distToFinish * 8, paths[0] ? paths[0]->numPoints : 0, paths[1] ? paths[1]->numPoints : 0, paths[2] ? paths[2]->numPoints : 0,
-	       numMoves);
+	       numMoves, numWarps);
 	return 1;
 }
 
@@ -338,6 +355,64 @@ static int MT_Coll_Active(void)
 	struct GameTracker *gGT = sdata->gGT;
 	return (s_mtColl.data != NULL) && (gGT->level1 == s_mtColl.level) && (gGT->level1 != NULL) && (gGT->level1->ptr_mesh_info != NULL) &&
 	       (gGT->level1->ptr_mesh_info->bspRoot == s_mtColl.levelRoot);
+}
+
+// each frame: a kart (player or bot) at a portal's entry comes out at its exit,
+// facing along the race line, its speed kept (Spyro Circuit: Nitro-Fueled
+// teleports the karts; its space between is not a place to drive)
+void MT_Coll_Tick(void)
+{
+	struct GameTracker *gGT = sdata->gGT;
+	if (!MT_Coll_Active() || (s_mtColl.numWarps == 0) || (sdata->pause_state != 0))
+		return;
+	for (int i = 0; i < 8; i++)
+	{
+		struct Driver *d = gGT->drivers[i];
+		if (d == NULL)
+			continue;
+		s32 x = d->posCurr.x >> 8, y = d->posCurr.y >> 8, z = d->posCurr.z >> 8;
+		for (u32 k = 0; k < s_mtColl.numWarps; k++)
+		{
+			const s16 *w = s_mtColl.warps[k];
+			s32 dx = x - w[0], dy = y - w[1], dz = z - w[2];
+			if ((dx * dx + dz * dz > (s32)w[7] * w[7]) || (dy > 600) || (dy < -600))
+				continue;
+			d->posCurr.x = d->posPrev.x = (s32)w[3] << 8;
+			d->posCurr.y = d->posPrev.y = ((s32)w[4] + 40) << 8;
+			d->posCurr.z = d->posPrev.z = (s32)w[5] << 8;
+			d->angle = w[6];
+			d->rotCurr.y = w[6];
+			if (d->actionsFlagSet & ACTION_BOT)
+			{
+				// (a bot follows its nav path: on from the frame nearest the exit)
+				s16 path = d->botData.botPath;
+				struct NavHeader *nh = ((path >= 0) && (path < 3)) ? sdata->NavPath_ptrHeader[path] : NULL;
+				if (nh != NULL)
+				{
+					struct NavFrame *f = NAVHEADER_GETFRAME(nh);
+					s32 best = 0x7fffffff, bi = -1;
+					for (s32 n = 0; n < nh->numPoints; n++)
+					{
+						s32 fx = f[n].pos.x - w[3], fz = f[n].pos.z - w[5];
+						s32 dd = fx * fx + fz * fz;
+						if (dd < best)
+						{
+							best = dd;
+							bi = n;
+						}
+					}
+					if (bi >= 0)
+					{
+						d->botData.botNavFrame = &f[bi];
+						d->botData.navProgressRemainder = 0;
+					}
+				}
+			}
+			if (i == 0)
+				printf("[MultiTrack] portal %u: player 1 to %d %d %d\n", k + 1, w[3], w[4], w[5]);
+			break;
+		}
+	}
 }
 
 // whether the karts collide with a Nitro-Fueled collision mesh now

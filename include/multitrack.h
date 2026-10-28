@@ -58,6 +58,7 @@ struct MTHeader *MT_Table(void);
 // custom track currently loaded (redirect active for gGT->levelID), or NULL
 struct MTEntry *MT_ActiveEntry(void);
 int MT_EntryKey(const struct MTEntry *e, char *key, size_t size); // an NF entry's asset key (nf-<slot> / nf-<id>), 0: not NF
+void MT_Coll_Tick(void);                                          // each frame: karts through an NF track's portals
 
 // NF minimaps (MT_Map.c, assets/track_maps/<key>.png + .map: scripts/nf_minimap.py)
 struct MTMap
