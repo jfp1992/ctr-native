@@ -114,14 +114,79 @@ internal void Platform_UpdateCursorVisibility(void)
 	}
 }
 
-internal void Platform_HandleFullscreenToggle(void)
-{
-	int fullscreen = (SDL_GetWindowFlags(g_window) & SDL_WINDOW_FULLSCREEN) != 0;
+// MultiTrack: display settings (main menu Settings, F11, settings.ini). The
+// resolution is the fullscreen display mode and the window's size; 0 x 0 =
+// the desktop's (fullscreen without a mode change, the window at its start size)
+#define PLATFORM_WINDOW_W 800
+#define PLATFORM_WINDOW_H 600
 
-	SDL_SetWindowFullscreen(g_window, fullscreen == 0);
+int Platform_GetDisplayModes(int *w, int *h, int max)
+{
+	int count = 0, n = 0;
+	SDL_DisplayMode **modes = SDL_GetFullscreenDisplayModes(SDL_GetDisplayForWindow(g_window), &count);
+	for (int i = 0; (modes != NULL) && (i < count) && (n < max); i++)
+	{
+		int seen = 0;
+		for (int j = 0; j < n; j++)
+		{
+			seen |= (w[j] == modes[i]->w) && (h[j] == modes[i]->h);
+		}
+		if (!seen)
+		{
+			w[n] = modes[i]->w;
+			h[n] = modes[i]->h;
+			n++;
+		}
+	}
+	SDL_free(modes);
+	return n; // (SDL lists them largest first)
+}
+
+void Platform_GetDisplay(int *w, int *h, int *fullscreen)
+{
+	*w = NativeSettings_GetInt("res_w", 0);
+	*h = NativeSettings_GetInt("res_h", 0);
+	*fullscreen = (SDL_GetWindowFlags(g_window) & SDL_WINDOW_FULLSCREEN) != 0;
+}
+
+void Platform_SetDisplay(int w, int h, int fullscreen)
+{
+	if (fullscreen)
+	{
+		// the mode of that size with the highest refresh rate (listed first)
+		const SDL_DisplayMode *pick = NULL;
+		int count = 0;
+		SDL_DisplayMode **modes = SDL_GetFullscreenDisplayModes(SDL_GetDisplayForWindow(g_window), &count);
+		for (int i = 0; (modes != NULL) && (i < count) && (pick == NULL) && (w > 0); i++)
+		{
+			pick = ((modes[i]->w == w) && (modes[i]->h == h)) ? modes[i] : NULL;
+		}
+		SDL_SetWindowFullscreenMode(g_window, pick); // (NULL: the desktop's)
+		SDL_free(modes);
+		SDL_SetWindowFullscreen(g_window, true);
+	}
+	else
+	{
+		SDL_SetWindowFullscreen(g_window, false);
+		SDL_SetWindowFullscreenMode(g_window, NULL);
+		SDL_SetWindowSize(g_window, (w > 0) ? w : PLATFORM_WINDOW_W, (h > 0) ? h : PLATFORM_WINDOW_H);
+	}
+	SDL_SyncWindow(g_window);
 	SDL_GetWindowSize(g_window, &g_windowWidth, &g_windowHeight);
 	Platform_UpdateCursorVisibility();
 	NativeRenderer_ResetDevice();
+
+	NativeSettings_SetInt("res_w", w);
+	NativeSettings_SetInt("res_h", h);
+	NativeSettings_SetInt("fullscreen", fullscreen != 0);
+	NativeSettings_Save();
+}
+
+internal void Platform_HandleFullscreenToggle(void)
+{
+	int w, h, fullscreen;
+	Platform_GetDisplay(&w, &h, &fullscreen);
+	Platform_SetDisplay(w, h, !fullscreen);
 }
 
 internal void Platform_UpdateHostAltKeyState(const s32 key, const s8 down)
@@ -290,6 +355,11 @@ void Platform_Init(const char *title, int width, int height)
 	}
 
 	atexit(Platform_Shutdown);
+	// MultiTrack: the saved resolution / fullscreen
+	if (NativeSettings_GetInt("fullscreen", 0) || (NativeSettings_GetInt("res_w", 0) > 0))
+	{
+		Platform_SetDisplay(NativeSettings_GetInt("res_w", 0), NativeSettings_GetInt("res_h", 0), NativeSettings_GetInt("fullscreen", 0));
+	}
 	Platform_UpdateCursorVisibility();
 	Platform_InputInit();
 }

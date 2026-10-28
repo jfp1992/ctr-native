@@ -24,6 +24,7 @@
 #include "platform/native_perf.h"
 #include "platform/native_replay_scheduler.h"
 #include "platform/native_savestate.h"
+#include "platform/native_settings.h"
 
 #include <platform.h>
 
@@ -58,7 +59,9 @@
 #include "platform/native_memcard.c"
 #include "platform/native_memcard_adapter.c"
 #include "platform/native_perf.c"
+#include "platform/native_settings.c" // MultiTrack
 #include "platform/native_rtx.c" // MultiTrack
+#include "platform/native_rtx_bake.c" // MultiTrack
 #include "platform/native_platform.c"
 #include "platform/native_replay_scheduler.c"
 #include "platform/native_renderer.c"
@@ -177,6 +180,8 @@ int main(int argc, char *argv[])
 	{
 		return NativeConsole_Return(1);
 	}
+
+	NativeSettings_Load(); // MultiTrack: settings.ini (window, ray tracing)
 
 #if defined(CTR_INTERNAL)
 	if (NativeReplayScheduler_PrepareReportFromArgs(argc, argv) != 0)
