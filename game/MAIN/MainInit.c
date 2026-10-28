@@ -571,6 +571,19 @@ void MainInit_FinalizeInit(struct GameTracker *gGT)
 			{
 				BOTS_Driver_Convert(gGT->drivers[0]);
 			}
+			// CTR_BOOT_POS=x,y,z[,angle]: player 1 starts there (level units; angle 0-4095)
+			const char *bootPos = getenv("CTR_BOOT_POS");
+			int bx, by, bz, ba = 0;
+			if ((bootPos != NULL) && (gGT->drivers[0] != NULL) && (sscanf(bootPos, "%d,%d,%d,%d", &bx, &by, &bz, &ba) >= 3))
+			{
+				struct Driver *d = gGT->drivers[0];
+				d->posCurr.x = d->posPrev.x = bx << 8;
+				d->posCurr.y = d->posPrev.y = by << 8;
+				d->posCurr.z = d->posPrev.z = bz << 8;
+				d->angle = (s16)ba;
+				d->rotCurr.y = (s16)ba;
+				printf("[MultiTrack] boot position %d %d %d, angle %d\n", bx, by, bz, ba);
+			}
 		}
 #endif
 	}

@@ -114,11 +114,24 @@ internal void NativeInput_SetSnapshotButtons(struct PlatformInputPadSnapshot *sn
 	snapshot->buttons[1] = (u8)(buttons >> 8);
 }
 
+// MultiTrack test harness (scripts/native_crash_test.py): CTR_BOOT_PLAYERS=<n>
+// plugs in n idle pads, so a split screen boot doesn't pause for missing ones
+internal s32 NativeInput_TestPads(void)
+{
+	static s32 s_testPads = -1;
+	if (s_testPads < 0)
+	{
+		const char *env = SDL_getenv("CTR_BOOT_PLAYERS");
+		s_testPads = env ? SDL_max(1, SDL_min(atoi(env), 4)) : 1;
+	}
+	return s_testPads;
+}
+
 internal void NativeInput_ResetSnapshot(s32 slot)
 {
 	struct PlatformInputPadSnapshot *snapshot = &s_controllers[slot].snapshot;
 
-	snapshot->connected = slot == 0;
+	snapshot->connected = slot < NativeInput_TestPads();
 	snapshot->status = snapshot->connected ? 0 : NATIVE_INPUT_PAD_DISCONNECT;
 	snapshot->id = snapshot->connected ? NATIVE_INPUT_PAD_DIGITAL : NATIVE_INPUT_PAD_DISCONNECT;
 	NativeInput_SetSnapshotButtons(snapshot, 0xffff);

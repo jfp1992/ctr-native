@@ -115,7 +115,11 @@ void MainFrame_RenderFrame(struct GameTracker *gGT, struct GamepadSystem *gGamep
 	MAINFRAME_PERF_END(NATIVE_PERF_BUCKET_MAINFRAME_QUEUE_INSTANCES);
 
 	MAINFRAME_PERF_BEGIN(NATIVE_PERF_BUCKET_MAINFRAME_EFFECTS);
-	RenderAllNormalParticles(gGT);
+	// MultiTrack: track select screenshots: no particles (the hidden karts' exhaust)
+	if (!MT_ShotClean())
+	{
+		RenderAllNormalParticles(gGT);
+	}
 
 	RenderDispEnv_World(gGT); // == RenderDispEnv_World ==
 
@@ -139,7 +143,10 @@ void MainFrame_RenderFrame(struct GameTracker *gGT, struct GamepadSystem *gGamep
 	RenderAllShadows(gGT);
 	Rtx_EndTag(&gGT->backBuffer->primMem);
 
-	RenderAllHeatParticles(gGT);
+	if (!MT_ShotClean())
+	{
+		RenderAllHeatParticles(gGT);
+	}
 
 	PushBuffer_FadeAllWindows();
 	MAINFRAME_PERF_END(NATIVE_PERF_BUCKET_MAINFRAME_EFFECTS);
@@ -505,6 +512,13 @@ void RenderAllHUD(struct GameTracker *gGT)
 
 	hudFlags = gGT->hudFlags;
 	gameMode1 = gGT->gameMode1;
+
+	// MultiTrack: track select screenshots (scripts/track_shots.py) show no HUD
+	MT_ShotTick();
+	if (MT_ShotClean())
+	{
+		return;
+	}
 
 	// if drawing intro-race title bars
 	if ((gGT->numPlyrCurrGame == 1) && ((hudFlags & HUD_FLAG_INTRO_RACE_TITLE_BARS) != 0) && ((gameMode1 & START_OF_RACE) != 0))
