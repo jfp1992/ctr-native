@@ -71,6 +71,7 @@ enum RtxInstMode
 	RTX_INST_CAPTURE, // solid model: ray traced geometry
 	RTX_INST_GLOW,    // transparent glowing model (turbo flames, fire jets): GL draws it, it lights the scene
 	RTX_INST_GL,      // ghosts and other transparent models: GL only
+	RTX_INST_HIDE,    // PS1 scenery a remaster mesh replaces: neither traced nor drawn
 };
 
 // something glowing (additive blend) seen this frame; clustered into point lights
@@ -707,6 +708,7 @@ void Rtx_BeginTag(int tag, struct PrimMem *primMem)
 
 static u32 Rtx_CapturePacketTo(u32 *words, int numWords, u16 serial, int allowSemi, struct RtxDynTri *out, int *num, int max);
 static void Rtx_SeatKart(const void *inst, int wheelStart, int wheelEnd);
+static void Rtx_SeatInstance(int start, int end);
 #define Rtx_CapturePacket(words, numWords, serial, allowSemi) \
 	Rtx_CapturePacketTo(words, numWords, serial, allowSemi, Rtx_DynTris(), &s_rtx.numDyn, (int)RTX_MAX_DYN_TRIS)
 static void Rtx_EmitterPacket(u32 *words, int numWords, u16 serial, int anyBlend);
@@ -765,6 +767,10 @@ void Rtx_EndTag(struct PrimMem *primMem)
 			else if (r->mode == RTX_INST_GL)
 			{
 			}
+			else if (r->mode == RTX_INST_HIDE)
+			{
+				Rtx_MarkCaptured((u32)p, RTX_MASK_ALL); // (GL skips it, nothing traced)
+			}
 			else
 			{
 				// opaque polygons are traced; the rest (glows, lamp cones) stays GL drawn and lights the scene
@@ -776,6 +782,7 @@ void Rtx_EndTag(struct PrimMem *primMem)
 				if (mask != RTX_MASK_ALL)
 				{
 					Rtx_EmitterPacket(p + 1, len, r->serial, 0);
+					glLeft = 1;
 				}
 			}
 			p += 1 + len;
@@ -790,6 +797,16 @@ void Rtx_EndTag(struct PrimMem *primMem)
 		if (wheelsOf != NULL)
 		{
 			Rtx_SeatKart(wheelsOf, dynStart, s_rtx.numDyn);
+		}
+		else if ((kart == NULL) && (r->mode == RTX_INST_CAPTURE) && !glLeft)
+		{
+			// (only models traced whole: the GL drawn rest, a piranha plant's
+			// semi-transparent mouth, would stay at the PS1 height)
+			Rtx_SeatInstance(dynStart, s_rtx.numDyn);
+		}
+		if (glLeft && (s_rtx.curModelId >= 0) && (s_rtx.curModelId < 256))
+		{
+			s_rtx.statGlLeftModel[s_rtx.curModelId]++;
 		}
 	}
 }
@@ -1065,7 +1082,23 @@ void Rtx_BeginInstance(struct PrimMem *primMem, struct Instance *inst, struct Pu
 	{
 		s_rtx.instMode = RTX_INST_CAPTURE;
 	}
+	if (RTX_HDR->remasterActive && (inst->model != NULL) && Rtx_LevelOwnsModel(inst->model))
+	{
+		for (int i = 0; i < 8; i++)
+		{
+			if ((RTX_HDR->remasterHide[i] != 0) && (RTX_HDR->remasterHide[i] == inst->model->id))
+			{
+				s_rtx.instMode = RTX_INST_HIDE;
+			}
+		}
+	}
+	// track select screenshots (CTR_SHOT_CLEAN): no karts
+	if (MT_ShotClean() && (inst->thread != NULL) && ((inst->thread->modelIndex == DYNAMIC_PLAYER) || (inst->thread->modelIndex == DYNAMIC_ROBOT_CAR)))
+	{
+		s_rtx.instMode = RTX_INST_HIDE;
+	}
 	s_rtx.statInstMode[s_rtx.instMode]++;
+	s_rtx.curModelId = (inst->model != NULL) ? inst->model->id : -1;
 
 	const MATRIX *m = &pb->matrix_ViewProj;
 	float rel[3] = {(float)(inst->matrix.t[0] - pb->pos.x), (float)(inst->matrix.t[1] - pb->pos.y), (float)(inst->matrix.t[2] - pb->pos.z)};

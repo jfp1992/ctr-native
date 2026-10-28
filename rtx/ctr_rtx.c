@@ -174,6 +174,8 @@ enum
 #define FIT_SAMPLES      4096u      // sun fit: sample vertices
 #define FIT_DIRS         1024u      // and candidate directions
 #define FIT_VEC4S        (1u + FIT_SAMPLES * 3u + FIT_DIRS * 3u)
+#define REM_MAX_TEX      1024u // remaster textures (common.glsl remTex[])
+#define TLAS_MAX_INST    8u
 
 static struct
 {
@@ -192,10 +194,13 @@ static struct
 	int haveTimestamps;
 
 	VkDescriptorSetLayout setLayout;
+	VkDescriptorSetLayout remLayout; // set 1: the remaster mesh (loadRemaster)
+	VkDescriptorPool remPool;
+	VkDescriptorSet remSet;
 	VkPipelineLayout pipeLayout;
 	VkDescriptorPool descPool;
 	VkDescriptorSet sets[2][PASS_COUNT];
-	VkPipeline pipeTrace, pipeAtrous, pipeFinal, pipeLights, pipeCache, pipeSunfit, pipeBloom, pipeBake, pipeTaa;
+	VkPipeline pipeTrace, pipeAtrous, pipeFinal, pipeLights, pipeCache, pipeSunfit, pipeBloom, pipeBake, pipeTaa, pipeWind, pipeRemBake;
 
 	// shared memory
 	uint8_t *shm;
@@ -218,6 +223,47 @@ static struct
 	int sunFit, hotspots, ambientSet;
 	uint32_t skyValid;
 	float sky[64][4]; // linear, scaled to the fitted sky light
+
+	// remaster mesh: a Nitro-Fueled level converted by scripts/nf_level.py, traced
+	// instead of the PS1 level mesh (which still drives the lighting fit)
+	int remSupported; // BC textures + descriptor indexing
+	int remActive;
+	uint32_t remStart[7]; // triangle groups (REM_*): opaque, alpha tested + water, grass, decals, animated, proxies; [6] = count
+	uint32_t remGrassVert, remAnimVert, remNumVerts; // dynamic vertices [remGrassVert, remNumVerts): grass, then animated nodes and proxies
+	uint32_t remNumTex;
+	Buf remVerts, remIdx, remTriMat, remMats, remDummy;
+	Buf remBake;   // baked mode: light per remaster vertex (rembake.comp)
+	int remBaked;  // (remBake holds this remaster's: baked or read from its cache)
+	char remKey[64];
+	uint64_t remStamp[2]; // the .rtxm's size and mtime (the bake cache's key)
+	Buf remGrassPos, remGrassIdx, remUpdScratch, remAnim; // dynamic vertices (wind.comp: position, normal, tangent), their BLASes' indices, refit scratch, animation
+	uint32_t remDynIdx[3]; // first triangle in remGrassIdx: grass, animated, proxies
+	Accel remBlas[6];
+	int remWind;      // grass sways (CTR_RTX_REMASTER_WIND)
+	int remDyn;       // dynamic vertices: wind.comp and the BLAS refits / rebuilds every frame
+	uint32_t remNumParts, remNumSlots;
+	struct
+	{
+		int32_t model, copy;
+		float light[8]; // PS1 model space position, colour, falloff, size (colour 0: none)
+	} remSlots[RTX_MAX_PROXY];
+	float remWindParams[4]; // strength, gust frequency, gust min, gust max (CGlobalWindData)
+	VkImage remImg[REM_MAX_TEX];
+	VkDeviceMemory remImgMem[REM_MAX_TEX];
+	VkImageView remView[REM_MAX_TEX];
+	VkSampler remSampler;
+	VkImage remSkyImg; // the level's skybox as a cube map (none: the PS1 sky table)
+	VkDeviceMemory remSkyMem;
+	VkImageView remSkyView;
+	// (bound wherever the remaster has no texture / sky: never a view freed with
+	// an earlier track's mesh, remWriteSet)
+	VkImage remBlankImg, remBlankCubeImg;
+	VkDeviceMemory remBlankMem, remBlankCubeMem;
+	VkImageView remBlankView, remBlankCubeView;
+	float remSkyTable[64][3]; // cube averaged into the F.sky cells, linear, unscaled
+	float remSkyScale;        // levelPrep: cube colour -> sky light
+	float *remLights;   // the level's point lights: 8 floats each (pos, radius, colour, 0)
+	uint32_t remNumLights;
 
 	// radiance cache (hash grid) and the static light grid
 	Buf cacheKeys, cacheAccum, cacheVal, lightGrid, fit, bake, levelTint, levelTintStage;
@@ -478,11 +524,20 @@ static void initVulkan(void)
 	}
 	float prio = 1.0f;
 	VkDeviceQueueCreateInfo qci = {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueFamilyIndex = R.queueFamily, .queueCount = 1, .pQueuePriorities = &prio};
+	// remaster meshes (loadRemaster): BC textures, indexed by material in the shaders
+	VkPhysicalDeviceVulkan12Features have12 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+	VkPhysicalDeviceFeatures2 have = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &have12};
+	vkGetPhysicalDeviceFeatures2(R.phys, &have);
+	R.remSupported = have.features.textureCompressionBC && have12.shaderSampledImageArrayNonUniformIndexing && have12.descriptorBindingPartiallyBound;
 	VkPhysicalDeviceRayQueryFeaturesKHR rq = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR, .rayQuery = VK_TRUE};
 	VkPhysicalDeviceAccelerationStructureFeaturesKHR asf = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR, &rq, .accelerationStructure = VK_TRUE};
-	VkPhysicalDeviceVulkan12Features v12 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &asf, .bufferDeviceAddress = VK_TRUE};
-	VkDeviceCreateInfo dci = {VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &v12, .queueCreateInfoCount = 1, .pQueueCreateInfos = &qci, .enabledExtensionCount = 3,
+	VkPhysicalDeviceVulkan12Features v12 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &asf, .bufferDeviceAddress = VK_TRUE,
+	                                        .descriptorIndexing = R.remSupported, .shaderSampledImageArrayNonUniformIndexing = R.remSupported,
+	                                        .descriptorBindingPartiallyBound = R.remSupported};
+	VkPhysicalDeviceFeatures2 f2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &v12, .features = {.textureCompressionBC = R.remSupported}};
+	VkDeviceCreateInfo dci = {VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &f2, .queueCreateInfoCount = 1, .pQueueCreateInfos = &qci, .enabledExtensionCount = budget ? 4 : 3,
 	                          .ppEnabledExtensionNames = exts};
+	R.memBudget = budget;
 	CHECK(vkCreateDevice(R.phys, &dci, NULL, &R.dev));
 	volkLoadDevice(R.dev);
 	vkGetDeviceQueue(R.dev, R.queueFamily, 0, &R.queue);
@@ -546,6 +601,88 @@ static VkPipeline makePipeline(const char *name)
 	return p;
 }
 
+// set 1: the remaster mesh's buffers and textures, or placeholders (no remaster:
+// the shaders never read them). Bindings: 0 vertices, 1 indices, 2 triangle
+// materials, 3 materials, 4 textures, 5 sky cube map, 6 dynamic vertices (wind.comp), 7 animation, 8 baked light
+#define REM_BINDINGS 9
+static void remImage(VkFormat fmt, uint32_t w, uint32_t h, uint32_t mips, uint32_t layers, VkImage *img, VkDeviceMemory *mem, VkImageView *view);
+static void imageBarrier(VkImage img, uint32_t mips, uint32_t layers, VkImageLayout from, VkImageLayout to, VkAccessFlags srcAccess, VkAccessFlags dstAccess,
+                         VkPipelineStageFlags src, VkPipelineStageFlags dst);
+
+// the blank texture and sky cube (black), made once
+static void remBlankInit(void)
+{
+	if (R.remBlankView)
+	{
+		return;
+	}
+	if (!R.remSampler)
+	{
+		VkSamplerCreateInfo sci = {VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO, .magFilter = VK_FILTER_LINEAR, .minFilter = VK_FILTER_LINEAR,
+		                           .mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR, .addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT,
+		                           .addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT, .addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT, .maxLod = 16.0f};
+		CHECK(vkCreateSampler(R.dev, &sci, NULL, &R.remSampler));
+	}
+	remImage(VK_FORMAT_B8G8R8A8_UNORM, 1, 1, 1, 1, &R.remBlankImg, &R.remBlankMem, &R.remBlankView);
+	remImage(VK_FORMAT_B8G8R8A8_UNORM, 1, 1, 1, 6, &R.remBlankCubeImg, &R.remBlankCubeMem, &R.remBlankCubeView);
+	VkClearColorValue black = {{0.0f, 0.0f, 0.0f, 1.0f}};
+	cmdBegin();
+	VkImage imgs[2] = {R.remBlankImg, R.remBlankCubeImg};
+	for (int k = 0; k < 2; k++)
+	{
+		uint32_t layers = k ? 6u : 1u;
+		VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, layers};
+		imageBarrier(imgs[k], 1, layers, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT,
+		             VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+		vkCmdClearColorImage(R.cmd, imgs[k], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &range);
+		imageBarrier(imgs[k], 1, layers, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
+		             VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+	}
+	cmdSubmitWait();
+}
+
+// set 1: the remaster mesh's buffers, textures and sky; every slot written each
+// time (an earlier track's freed images never stay bound: the GPU faulted on
+// them after a switch to a track with fewer textures or no sky of its own)
+static void remWriteSet(void)
+{
+	static const uint32_t bufBinding[7] = {0, 1, 2, 3, 6, 7, 8};
+	Buf *b[7] = {&R.remVerts, &R.remIdx, &R.remTriMat, &R.remMats, &R.remGrassPos, &R.remAnim, &R.remBake};
+	VkDescriptorBufferInfo bi[7];
+	VkWriteDescriptorSet w[REM_BINDINGS];
+	for (uint32_t i = 0; i < 7; i++)
+	{
+		bi[i] = (VkDescriptorBufferInfo){((R.remActive && b[i]->buf) ? b[i] : &R.remDummy)->buf, 0, VK_WHOLE_SIZE};
+		w[i] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = R.remSet, .dstBinding = bufBinding[i], .descriptorCount = 1,
+		                              .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &bi[i]};
+	}
+	uint32_t nw = 7;
+	if (!R.remSupported)
+	{
+		vkUpdateDescriptorSets(R.dev, nw, w, 0, NULL);
+		return;
+	}
+	remBlankInit();
+	static VkDescriptorImageInfo ii[REM_MAX_TEX];
+	uint32_t fallback = 0;
+	while ((fallback < R.remNumTex) && !R.remView[fallback])
+	{
+		fallback++;
+	}
+	for (uint32_t i = 0; i < REM_MAX_TEX; i++)
+	{
+		// (missing textures: any loaded one; materials never point at them)
+		VkImageView v = (R.remActive && (i < R.remNumTex) && (fallback < R.remNumTex)) ? R.remView[R.remView[i] ? i : fallback] : R.remBlankView;
+		ii[i] = (VkDescriptorImageInfo){R.remSampler, v, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+	}
+	w[nw++] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = R.remSet, .dstBinding = 4, .descriptorCount = REM_MAX_TEX,
+	                                 .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = ii};
+	VkDescriptorImageInfo si = {R.remSampler, (R.remActive && R.remSkyView) ? R.remSkyView : R.remBlankCubeView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+	w[nw++] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = R.remSet, .dstBinding = 5, .descriptorCount = 1,
+	                                 .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &si};
+	vkUpdateDescriptorSets(R.dev, nw, w, 0, NULL);
+}
+
 static void initPipelines(void)
 {
 	VkDescriptorSetLayoutBinding b[B_COUNT];
@@ -556,8 +693,33 @@ static void initPipelines(void)
 	}
 	VkDescriptorSetLayoutCreateInfo lci = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = B_COUNT, .pBindings = b};
 	CHECK(vkCreateDescriptorSetLayout(R.dev, &lci, NULL, &R.setLayout));
+
+	// set 1: remaster mesh vertices, indices, triangle materials, materials, textures
+	// (bound for every pass; textures only partly: as many as the level has)
+	VkDescriptorSetLayoutBinding rb[REM_BINDINGS];
+	VkDescriptorBindingFlags rf[REM_BINDINGS];
+	for (uint32_t i = 0; i < REM_BINDINGS; i++)
+	{
+		int image = (i == 4) || (i == 5);
+		rb[i] = (VkDescriptorSetLayoutBinding){i, image ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+		                                       (i == 4) ? REM_MAX_TEX : 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL};
+		rf[i] = (image && R.remSupported) ? VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT : 0;
+	}
+	VkDescriptorSetLayoutBindingFlagsCreateInfo rfi = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO, .bindingCount = REM_BINDINGS,
+	                                                   .pBindingFlags = rf};
+	VkDescriptorSetLayoutCreateInfo rli = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, &rfi, .bindingCount = REM_BINDINGS, .pBindings = rb};
+	CHECK(vkCreateDescriptorSetLayout(R.dev, &rli, NULL, &R.remLayout));
+	VkDescriptorPoolSize rps[2] = {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 7}, {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, REM_MAX_TEX + 1}};
+	VkDescriptorPoolCreateInfo rpi = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 1, .poolSizeCount = 2, .pPoolSizes = rps};
+	CHECK(vkCreateDescriptorPool(R.dev, &rpi, NULL, &R.remPool));
+	VkDescriptorSetAllocateInfo rai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorPool = R.remPool, .descriptorSetCount = 1, .pSetLayouts = &R.remLayout};
+	CHECK(vkAllocateDescriptorSets(R.dev, &rai, &R.remSet));
+	R.remDummy = bufCreate(256, USAGE_STORAGE, DEVICE_LOCAL);
+	remWriteSet();
+
 	VkPushConstantRange pcr = {VK_SHADER_STAGE_COMPUTE_BIT, 0, 4};
-	VkPipelineLayoutCreateInfo pli = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1, .pSetLayouts = &R.setLayout, .pushConstantRangeCount = 1,
+	VkDescriptorSetLayout setLayouts[2] = {R.setLayout, R.remLayout};
+	VkPipelineLayoutCreateInfo pli = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 2, .pSetLayouts = setLayouts, .pushConstantRangeCount = 1,
 	                                  .pPushConstantRanges = &pcr};
 	CHECK(vkCreatePipelineLayout(R.dev, &pli, NULL, &R.pipeLayout));
 
@@ -574,6 +736,7 @@ static void initPipelines(void)
 	CHECK(vkAllocateDescriptorSets(R.dev, &dai, &R.sets[0][0]));
 
 	R.pipeTrace = makePipeline("trace");
+	R.pipeRemBake = makePipeline("rembake");
 	R.pipeAtrous = makePipeline("atrous");
 	R.pipeFinal = makePipeline("final");
 	R.pipeLights = makePipeline("lights");
@@ -582,6 +745,7 @@ static void initPipelines(void)
 	R.pipeBloom = makePipeline("bloom");
 	R.pipeBake = makePipeline("bake");
 	R.pipeTaa = makePipeline("taa");
+	R.pipeWind = makePipeline("wind");
 }
 
 // ---- acceleration structures -----------------------------------------------------
@@ -652,6 +816,700 @@ static void buildBlas(Accel *a, VkAccelerationStructureGeometryKHR *geom, uint32
 	VkAccelerationStructureBuildRangeInfoKHR range = {.primitiveCount = primCount};
 	const VkAccelerationStructureBuildRangeInfoKHR *pr = &range;
 	vkCmdBuildAccelerationStructuresKHR(R.cmd, 1, &bi, &pr);
+}
+
+// ---- remaster mesh (scripts/nf_level.py .rtxm) ------------------------------------
+
+static float srgbLin(float c);
+static uint8_t *s_bakeKeep; // levelPrep: vertices a GL bake leaves as the art has them
+
+struct RtxmHeader // scripts/nf_level.py HEADER (version 4)
+{
+	char magic[4];
+	uint32_t version;
+	uint32_t numVerts, numTris, numMats, numTex;
+	uint32_t numLights, skySize;
+	uint32_t groupStart[5]; // alpha tested + water, grass, decals, animated, proxies (opaque from 0)
+	uint32_t grassVert;     // first dynamic vertex: grass, then animated nodes and proxies
+	uint32_t animVert;      // first animated / proxy vertex
+	uint32_t numSlots;      // proxy slots
+	uint64_t offVerts, offTris, offMats, offTex, offLights, offSky;
+	int16_t hide[8]; // PS1 model ids the remaster replaces (RtxHeader.remasterHide)
+	float wind[4];   // strength, gust frequency, gust min, gust max
+	uint32_t numParts, animWords; // animation section (u32 words): moving parts, keys, their vertices, proxy slots
+	uint64_t offAnim;
+};
+_Static_assert(sizeof(struct RtxmHeader) == 160, "RtxmHeader layout");
+
+// triangle groups (instance custom index = REM_INST + group)
+enum
+{
+	REM_OPAQUE,
+	REM_ALPHA,
+	REM_GRASS,
+	REM_DECAL,
+	REM_ANIM,  // animated nodes (keyframed: propellers, fans, gears), refitted every frame
+	REM_PROXY, // moving PS1 objects drawn as remaster models (instance matrices from the game), rebuilt every frame
+	REM_GROUPS
+};
+#define REM_INST 3u
+
+// material flags (nf_level.py, common.glsl)
+#define MAT_GRASS 32u
+
+static void remDestroy(void)
+{
+	R.hdr->remasterActive = 0;
+	for (int i = 0; i < 8; i++)
+	{
+		R.hdr->remasterHide[i] = 0;
+	}
+	for (int i = 0; i < 4; i++)
+	{
+		R.hdr->remasterProxy[i] = 0;
+	}
+	vkDeviceWaitIdle(R.dev);
+	Buf *bufs[] = {&R.remVerts, &R.remIdx, &R.remTriMat, &R.remMats, &R.remGrassPos, &R.remGrassIdx, &R.remUpdScratch, &R.remAnim, &R.remBake};
+	R.remBaked = 0;
+	for (unsigned i = 0; i < sizeof(bufs) / sizeof(*bufs); i++)
+	{
+		bufDestroy(bufs[i]);
+	}
+	for (int k = 0; k < REM_GROUPS; k++)
+	{
+		accelDestroy(&R.remBlas[k]);
+	}
+	for (uint32_t i = 0; i < R.remNumTex; i++)
+	{
+		if (R.remView[i])
+		{
+			vkDestroyImageView(R.dev, R.remView[i], NULL);
+			vkDestroyImage(R.dev, R.remImg[i], NULL);
+			vkFreeMemory(R.dev, R.remImgMem[i], NULL);
+		}
+		R.remView[i] = VK_NULL_HANDLE;
+		R.remImg[i] = VK_NULL_HANDLE;
+		R.remImgMem[i] = VK_NULL_HANDLE;
+	}
+	if (R.remSkyView)
+	{
+		vkDestroyImageView(R.dev, R.remSkyView, NULL);
+		vkDestroyImage(R.dev, R.remSkyImg, NULL);
+		vkFreeMemory(R.dev, R.remSkyMem, NULL);
+		R.remSkyView = VK_NULL_HANDLE;
+		R.remSkyImg = VK_NULL_HANDLE;
+		R.remSkyMem = VK_NULL_HANDLE;
+	}
+	free(R.remLights);
+	R.remLights = NULL;
+	R.remNumLights = 0;
+	R.remNumTex = 0;
+	R.remActive = 0;
+	R.remWind = 0;
+	R.remDyn = 0;
+	R.remNumParts = R.remNumSlots = 0;
+	memset(R.remStart, 0, sizeof(R.remStart));
+}
+
+static void imageBarrier(VkImage img, uint32_t mips, uint32_t layers, VkImageLayout from, VkImageLayout to, VkAccessFlags srcAccess, VkAccessFlags dstAccess,
+                         VkPipelineStageFlags src, VkPipelineStageFlags dst)
+{
+	VkImageMemoryBarrier b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, .srcAccessMask = srcAccess, .dstAccessMask = dstAccess, .oldLayout = from, .newLayout = to,
+	                          .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .image = img,
+	                          .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, mips, 0, layers}};
+	vkCmdPipelineBarrier(R.cmd, src, dst, 0, 0, NULL, 0, NULL, 1, &b);
+}
+
+// a device-local image (+ view) of format fmt, w x h, mips, 1 or 6 (cube) layers
+static void remImage(VkFormat fmt, uint32_t w, uint32_t h, uint32_t mips, uint32_t layers, VkImage *img, VkDeviceMemory *mem, VkImageView *view)
+{
+	VkImageCreateInfo ici = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .flags = (layers == 6) ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0,
+	                         .imageType = VK_IMAGE_TYPE_2D, .format = fmt, .extent = {w, h, 1}, .mipLevels = mips, .arrayLayers = layers,
+	                         .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
+	                         .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
+	CHECK(vkCreateImage(R.dev, &ici, NULL, img));
+	VkMemoryRequirements req;
+	vkGetImageMemoryRequirements(R.dev, *img, &req);
+	VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = req.size, .memoryTypeIndex = memType(req.memoryTypeBits, DEVICE_LOCAL)};
+	CHECK(vkAllocateMemory(R.dev, &ai, NULL, mem));
+	CHECK(vkBindImageMemory(R.dev, *img, *mem, 0));
+	VkImageViewCreateInfo vci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = *img, .viewType = (layers == 6) ? VK_IMAGE_VIEW_TYPE_CUBE : VK_IMAGE_VIEW_TYPE_2D,
+	                             .format = fmt, .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, mips, 0, layers}};
+	CHECK(vkCreateImageView(R.dev, &vci, NULL, view));
+}
+
+// a remaster group's BLAS geometry: its triangles over the stored vertices, or
+// (grass, animated, proxies) over the dynamic ones
+static VkAccelerationStructureGeometryKHR remGeometry(int k, uint32_t numVerts)
+{
+	int dyn = (k == REM_GRASS) ? 0 : (k == REM_ANIM) ? 1 : (k == REM_PROXY) ? 2 : -1;
+	if (dyn >= 0)
+	{
+		return triGeometry(R.remGrassPos.addr, 20, R.remNumVerts - R.remGrassVert - 1, R.remGrassIdx.addr + (VkDeviceSize)R.remDynIdx[dyn] * 12);
+	}
+	return triGeometry(R.remVerts.addr, 32, numVerts - 1, R.remIdx.addr + (VkDeviceSize)R.remStart[k] * 12);
+}
+
+static VkBuildAccelerationStructureFlagsKHR remBlasFlags(int k)
+{
+	if (k == REM_PROXY)
+	{
+		return VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT_KHR;
+	}
+	return VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR | (((k == REM_GRASS) || (k == REM_ANIM)) ? VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR : 0);
+}
+
+// GPU memory in use (VK_EXT_memory_budget: device local heaps, all processes)
+// and this process' resident host memory, logged after each level load: a level
+// switch must leave them where they were
+static void memLog(const char *what)
+{
+	double used = 0.0, budget = 0.0;
+	if (R.memBudget)
+	{
+		VkPhysicalDeviceMemoryBudgetPropertiesEXT mb = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+		VkPhysicalDeviceMemoryProperties2 mp = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, &mb};
+		vkGetPhysicalDeviceMemoryProperties2(R.phys, &mp);
+		for (uint32_t i = 0; i < mp.memoryProperties.memoryHeapCount; i++)
+		{
+			if (mp.memoryProperties.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
+			{
+				used += (double)mb.heapUsage[i];
+				budget += (double)mb.heapBudget[i];
+			}
+		}
+	}
+	long pages = 0, rss = 0;
+	FILE *f = fopen("/proc/self/statm", "r");
+	if (f)
+	{
+		if (fscanf(f, "%ld %ld", &pages, &rss) != 2)
+		{
+			rss = 0;
+		}
+		fclose(f);
+	}
+	logf_("memory after %s: GPU %.0f / %.0f MB, host resident %.0f MB", what, used / 1e6, budget / 1e6, (double)rss * (double)sysconf(_SC_PAGESIZE) / 1e6);
+}
+
+// what loadRemasterMesh holds while it works (freed if it gives up half way)
+static uint8_t *s_remData;
+static uint32_t *s_remScratch[3];
+static Buf s_remStage;
+
+static void remFreeLoad(void)
+{
+	free(s_remData);
+	s_remData = NULL;
+	for (int i = 0; i < 3; i++)
+	{
+		free(s_remScratch[i]);
+		s_remScratch[i] = NULL;
+	}
+	bufDestroy(&s_remStage);
+}
+
+static void loadRemasterMesh(const char *key);
+
+// the remaster mesh of a Nitro-Fueled track (key nf-<slot>), assets/rtx_remaster/<key>.rtxm
+// (CTR_RTX_REMASTER=0: never; CTR_RTX_REMASTER_GRASS=0: without grass and foliage;
+// CTR_RTX_REMASTER_WIND=0: foliage stands still). A Vulkan failure on the way
+// (out of memory) drops the mesh, the PS1 level is traced, the renderer lives on.
+static void loadRemaster(const char *key)
+{
+	static jmp_buf jb;
+	if (setjmp(jb))
+	{
+		s_softFail = NULL;
+		logf_("remaster %s: could not be loaded (GPU memory?), the PS1 level is traced", key);
+		vkDeviceWaitIdle(R.dev);
+		remFreeLoad();
+		remDestroy();
+		remWriteSet();
+		memLog(key);
+		return;
+	}
+	s_softFail = &jb;
+	loadRemasterMesh(key);
+	s_softFail = NULL;
+	remFreeLoad();
+	memLog(key);
+}
+
+static void loadRemasterMesh(const char *key)
+{
+	remDestroy();
+	const char *env = getenv("CTR_RTX_REMASTER");
+	if ((env && (atoi(env) == 0)) || !R.remSupported || strncmp(key, "nf-", 3))
+	{
+		remWriteSet();
+		return;
+	}
+	char path[1400];
+	snprintf(path, sizeof(path), "%s/assets/rtx_remaster/%s.rtxm", s_exeDir, key);
+	FILE *f = fopen(path, "rb");
+	if (!f)
+	{
+		logf_("no %s: the PS1 level is traced", path);
+		remWriteSet();
+		return;
+	}
+	double t0 = nowMs();
+	fseek(f, 0, SEEK_END);
+	size_t size = (size_t)ftell(f);
+	fseek(f, 0, SEEK_SET);
+	uint8_t *data = s_remData = malloc(size);
+	struct RtxmHeader *h = (struct RtxmHeader *)data;
+	int ok = data && (fread(data, 1, size, f) == size) && (size >= sizeof(*h));
+	fclose(f);
+	ok = ok && !memcmp(h->magic, "RTXM", 4) && (h->version == 4) && (h->numTex <= REM_MAX_TEX) && (h->offVerts + (uint64_t)h->numVerts * 32 <= size) &&
+	     (h->offTris + (uint64_t)h->numTris * 16 <= size) && (h->offMats + (uint64_t)h->numMats * 48 <= size) && (h->offTex + (uint64_t)h->numTex * 32 <= size) &&
+	     (h->offLights + (uint64_t)h->numLights * 32 <= size) && (h->offSky + 6ull * h->skySize * h->skySize * 4 <= size) &&
+	     (h->offAnim + (uint64_t)h->animWords * 4 <= size) && (h->grassVert <= h->animVert) && (h->animVert <= h->numVerts) && (h->numSlots <= RTX_MAX_PROXY);
+	for (int g = 0; ok && (g < 5); g++)
+	{
+		ok = (h->groupStart[g] <= ((g < 4) ? h->groupStart[g + 1] : h->numTris));
+	}
+	// animation: numParts, keys at, vertices at, vertices, slots at, slots (words)
+	const uint32_t *anim = ok ? (const uint32_t *)(data + h->offAnim) : NULL;
+	ok = ok && (!h->numParts || ((h->animWords >= 8) && (anim[0] == h->numParts) && (anim[2] + (uint64_t)anim[3] * 6 <= h->animWords) &&
+	                             (anim[3] == h->numVerts - h->animVert) && (anim[4] + (uint64_t)anim[5] * 12 <= h->animWords) && (anim[5] == h->numSlots)));
+	if (!ok)
+	{
+		logf_("%s: not a version 4 remaster mesh (rebuild: scripts/nf_level.py all)", path);
+		remWriteSet();
+		return;
+	}
+
+	// triangles: indices (AS input, 3 words each) and materials apart, by group; grass
+	// left out if asked, and its own index copy rebased onto the animated positions
+	const uint32_t *tris = (const uint32_t *)(data + h->offTris);
+	const uint32_t *mats = (const uint32_t *)(data + h->offMats);
+	int grass = !getenv("CTR_RTX_REMASTER_GRASS") || atoi(getenv("CTR_RTX_REMASTER_GRASS"));
+	uint32_t bounds[REM_GROUPS + 1] = {0, h->groupStart[0], h->groupStart[1], h->groupStart[2], h->groupStart[3], h->groupStart[4], h->numTris};
+	uint32_t *idx = s_remScratch[0] = malloc((size_t)h->numTris * 12 + 12), *tm = s_remScratch[1] = malloc((size_t)h->numTris * 4 + 4),
+	         *gidx = s_remScratch[2] = malloc((size_t)h->numTris * 12 + 12);
+	if (!idx || !tm || !gidx)
+	{
+		logf_("%s: out of host memory", path);
+		remWriteSet();
+		return;
+	}
+	uint32_t nt = 0, ng = 0, dynCount[3] = {0, 0, 0};
+	for (int g = 0; g < REM_GROUPS; g++)
+	{
+		R.remStart[g] = nt;
+		// grass, animated nodes, proxies: their own index copy, rebased onto the
+		// dynamic vertices (wind.comp writes those), which they alone may use
+		int dyn = (g == REM_GRASS) ? 0 : (g == REM_ANIM) ? 1 : (g == REM_PROXY) ? 2 : -1;
+		uint32_t vmin = (dyn == 0) ? h->grassVert : (dyn > 0) ? h->animVert : 0, vmax = (dyn == 0) ? h->animVert : h->numVerts;
+		if (dyn >= 0)
+		{
+			R.remDynIdx[dyn] = ng;
+		}
+		for (uint32_t i = bounds[g]; i < bounds[g + 1]; i++)
+		{
+			const uint32_t *t = &tris[i * 4];
+			if ((t[0] >= h->numVerts) || (t[1] >= h->numVerts) || (t[2] >= h->numVerts) || (t[3] >= h->numMats) || ((g == REM_GRASS) && !grass))
+			{
+				continue;
+			}
+			if ((dyn >= 0) && ((t[0] < vmin) || (t[1] < vmin) || (t[2] < vmin) || (t[0] >= vmax) || (t[1] >= vmax) || (t[2] >= vmax)))
+			{
+				continue;
+			}
+			memcpy(&idx[nt * 3], t, 12);
+			tm[nt++] = t[3];
+			if (dyn >= 0)
+			{
+				for (int c = 0; c < 3; c++)
+				{
+					gidx[ng * 3 + c] = t[c] - h->grassVert;
+				}
+				ng++;
+				dynCount[dyn]++;
+			}
+		}
+	}
+	R.remStart[REM_GROUPS] = nt;
+	R.remNumVerts = h->numVerts;
+	R.remGrassVert = h->grassVert;
+	R.remAnimVert = h->animVert;
+	R.remVerts = uploadBuf(data + h->offVerts, (VkDeviceSize)h->numVerts * 32, USAGE_AS_INPUT);
+	R.remIdx = uploadBuf(idx, (VkDeviceSize)nt * 12, USAGE_AS_INPUT);
+	R.remTriMat = uploadBuf(tm, (VkDeviceSize)nt * 4, 0);
+	R.remMats = uploadBuf(mats, (VkDeviceSize)h->numMats * 48, 0);
+	uint32_t nGrassVerts = h->numVerts - h->grassVert; // (the dynamic vertices)
+	if (ng > 0)
+	{
+		// dynamic vertices (5 words: position, normal, tangent) start at rest;
+		// wind.comp moves them every frame
+		uint32_t *gp = malloc((size_t)nGrassVerts * 20);
+		const uint32_t *v = (const uint32_t *)(data + h->offVerts);
+		for (uint32_t i = 0; i < nGrassVerts; i++)
+		{
+			const uint32_t *src = &v[(size_t)(h->grassVert + i) * 8];
+			uint32_t rec[5] = {src[0], src[1], src[2], src[5], src[7]};
+			memcpy(&gp[i * 5], rec, 20);
+		}
+		R.remGrassPos = uploadBuf(gp, (VkDeviceSize)nGrassVerts * 20, USAGE_AS_INPUT);
+		R.remGrassIdx = uploadBuf(gidx, (VkDeviceSize)ng * 12, USAGE_AS_INPUT);
+		free(gp);
+	}
+	for (int i = 0; i < 3; i++)
+	{
+		free(s_remScratch[i]);
+		s_remScratch[i] = NULL;
+	}
+	const char *wenv = getenv("CTR_RTX_REMASTER_WIND");
+	R.remWind = (dynCount[0] > 0) && (!wenv || atoi(wenv));
+	R.remDyn = (ng > 0);
+	memcpy(R.remWindParams, h->wind, sizeof(R.remWindParams));
+	// moving parts and proxy slots (wind.comp reads the section as it is)
+	R.remNumParts = h->numParts;
+	R.remNumSlots = h->numParts ? h->numSlots : 0;
+	if (h->numParts)
+	{
+		R.remAnim = uploadBuf(anim, (VkDeviceSize)h->animWords * 4, 0);
+		for (uint32_t i = 0; i < R.remNumSlots; i++)
+		{
+			const uint32_t *w = &anim[anim[4] + i * 12];
+			R.remSlots[i].model = (int32_t)w[0];
+			R.remSlots[i].copy = (int32_t)w[1];
+			memcpy(R.remSlots[i].light, &w[2], sizeof(R.remSlots[i].light));
+		}
+	}
+
+	// textures: BC blocks / BGRA, every mip as stored
+	if (!R.remSampler)
+	{
+		VkSamplerCreateInfo sci = {VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO, .magFilter = VK_FILTER_LINEAR, .minFilter = VK_FILTER_LINEAR,
+		                           .mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR, .addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT,
+		                           .addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT, .addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT, .maxLod = 16.0f};
+		CHECK(vkCreateSampler(R.dev, &sci, NULL, &R.remSampler));
+	}
+	VkDeviceSize skyBytes = 6ull * h->skySize * h->skySize * 4;
+	VkDeviceSize texBytes = skyBytes;
+	for (uint32_t i = 0; i < h->numTex; i++)
+	{
+		const uint64_t *e = (const uint64_t *)(data + h->offTex + i * 32 + 16);
+		texBytes += (e[0] + e[1] <= size) ? e[1] : 0;
+	}
+	s_remStage = bufCreate(texBytes ? texBytes : 256, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, HOST_MEM);
+	Buf stage = s_remStage;
+	R.remNumTex = h->numTex;
+	VkDeviceSize at = 0;
+	cmdBegin();
+	for (uint32_t i = 0; i < h->numTex; i++)
+	{
+		const uint32_t *e = (const uint32_t *)(data + h->offTex + i * 32);
+		const uint64_t *eo = (const uint64_t *)&e[4];
+		uint32_t kind = e[0], w = e[1], th = e[2], mips = e[3];
+		VkFormat fmt = (kind == 1) ? VK_FORMAT_BC1_RGBA_UNORM_BLOCK : (kind == 3) ? VK_FORMAT_BC3_UNORM_BLOCK : (kind == 5) ? VK_FORMAT_BC5_UNORM_BLOCK
+		             : (kind == 8) ? VK_FORMAT_B8G8R8A8_UNORM : (kind == 9) ? VK_FORMAT_R8G8B8A8_UNORM : VK_FORMAT_UNDEFINED;
+		uint32_t blockBytes = (kind == 1) ? 8 : (kind == 3 || kind == 5) ? 16 : 4, blockPx = (kind <= 5) ? 4 : 1;
+		if ((fmt == VK_FORMAT_UNDEFINED) || !w || !th || !mips || (mips > 16) || (eo[0] + eo[1] > size))
+		{
+			continue;
+		}
+		// the mips must add up to what is stored
+		VkDeviceSize need = 0;
+		for (uint32_t m = 0, mw = w, mh = th; m < mips; m++, mw = (mw > 1) ? mw / 2 : 1, mh = (mh > 1) ? mh / 2 : 1)
+		{
+			need += (VkDeviceSize)((mw + blockPx - 1) / blockPx) * ((mh + blockPx - 1) / blockPx) * blockBytes;
+		}
+		if (need != eo[1])
+		{
+			logf_("%s: texture %u size mismatch", path, i);
+			continue;
+		}
+		remImage(fmt, w, th, mips, 1, &R.remImg[i], &R.remImgMem[i], &R.remView[i]);
+		memcpy((uint8_t *)stage.map + at, data + eo[0], eo[1]);
+		imageBarrier(R.remImg[i], mips, 1, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT,
+		             VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+		VkBufferImageCopy copies[16];
+		VkDeviceSize mo = at;
+		for (uint32_t m = 0, mw = w, mh = th; m < mips; m++, mw = (mw > 1) ? mw / 2 : 1, mh = (mh > 1) ? mh / 2 : 1)
+		{
+			copies[m] = (VkBufferImageCopy){.bufferOffset = mo, .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, m, 0, 1}, .imageExtent = {mw, mh, 1}};
+			mo += (VkDeviceSize)((mw + blockPx - 1) / blockPx) * ((mh + blockPx - 1) / blockPx) * blockBytes;
+		}
+		vkCmdCopyBufferToImage(R.cmd, stage.buf, R.remImg[i], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, mips, copies);
+		imageBarrier(R.remImg[i], mips, 1, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
+		             VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+		at += eo[1];
+	}
+	// the skybox cube map, and its colours averaged into the sky table's cells
+	// (levelPrep scales those to the fitted sky light)
+	memset(R.remSkyTable, 0, sizeof(R.remSkyTable));
+	if (h->skySize)
+	{
+		uint32_t n = h->skySize;
+		remImage(VK_FORMAT_B8G8R8A8_UNORM, n, n, 1, 6, &R.remSkyImg, &R.remSkyMem, &R.remSkyView);
+		const uint8_t *px = data + h->offSky;
+		memcpy((uint8_t *)stage.map + at, px, skyBytes);
+		imageBarrier(R.remSkyImg, 1, 6, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT,
+		             VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+		VkBufferImageCopy c = {.bufferOffset = at, .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 6}, .imageExtent = {n, n, 1}};
+		vkCmdCopyBufferToImage(R.cmd, stage.buf, R.remSkyImg, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
+		imageBarrier(R.remSkyImg, 1, 6, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
+		             VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+		at += skyBytes;
+		// every texel's direction -> its sky table cell (8 elevations top first x 8
+		// azimuths, as common.glsl skyRadiance reads them)
+		double sum[64][3] = {{0}};
+		uint32_t cnt[64] = {0};
+		for (uint32_t face = 0; face < 6; face++)
+		{
+			for (uint32_t y = 0; y < n; y += 4)
+			{
+				for (uint32_t x = 0; x < n; x += 4)
+				{
+					float u = ((float)x + 0.5f) / (float)n * 2.0f - 1.0f, v = ((float)y + 0.5f) / (float)n * 2.0f - 1.0f;
+					float d[6][3] = {{1, -v, -u}, {-1, -v, u}, {u, 1, v}, {u, -1, -v}, {u, -v, 1}, {-u, -v, -1}};
+					float *dd = d[face];
+					float l = sqrtf(dd[0] * dd[0] + dd[1] * dd[1] + dd[2] * dd[2]);
+					float el = asinf(fmaxf(-1.0f, fminf(1.0f, dd[1] / l)));
+					int r = (int)((0.5f - el / 3.14159265f) * 8.0f);
+					int col = (int)((atan2f(dd[2], dd[0]) / 6.2831853f + 0.5f) * 8.0f);
+					r = r < 0 ? 0 : (r > 7 ? 7 : r);
+					col = col < 0 ? 0 : (col > 7 ? 7 : col);
+					const uint8_t *b = &px[((size_t)face * n * n + (size_t)y * n + x) * 4];
+					for (int k = 0; k < 3; k++)
+					{
+						sum[r * 8 + col][k] += srgbLin(b[2 - k] / 255.0f);
+					}
+					cnt[r * 8 + col]++;
+				}
+			}
+		}
+		for (int c = 0; c < 64; c++)
+		{
+			for (int k = 0; k < 3; k++)
+			{
+				R.remSkyTable[c][k] = cnt[c] ? (float)(sum[c][k] / cnt[c]) : 0.0f;
+			}
+		}
+	}
+	cmdSubmitWait();
+	bufDestroy(&s_remStage);
+
+	R.remNumLights = h->numLights;
+	R.remLights = malloc(sizeof(float) * 8 * (h->numLights + 1));
+	memcpy(R.remLights, data + h->offLights, (size_t)h->numLights * 32);
+	for (int i = 0; i < 8; i++)
+	{
+		R.hdr->remasterHide[i] = h->hide[i];
+	}
+	for (uint32_t i = 0, n = 0; (i < R.remNumSlots) && (n < 4); i++)
+	{
+		int seen = 0;
+		for (uint32_t k = 0; k < n; k++)
+		{
+			seen |= (R.hdr->remasterProxy[k] == R.remSlots[i].model);
+		}
+		if (!seen)
+		{
+			R.hdr->remasterProxy[n++] = (int16_t)R.remSlots[i].model;
+		}
+	}
+	uint32_t numVerts = h->numVerts, skySize = h->skySize, numTex = h->numTex;
+	free(data);
+	s_remData = NULL;
+
+	// a BLAS per group: opaque (the RT hardware settles its hits), alpha tested
+	// (candidateAccept), decals (never hit: common.glsl remDecals looks for them)
+	// over the vertices as stored; grass and animated nodes (refitted as the wind
+	// / their keys move them) and proxies (rebuilt where the game has them) over
+	// the dynamic ones
+	VkDeviceSize updScratch = 0;
+	for (int k = 0; k < REM_GROUPS; k++)
+	{
+		uint32_t count = R.remStart[k + 1] - R.remStart[k];
+		if (!count)
+		{
+			continue;
+		}
+		VkAccelerationStructureGeometryKHR g = remGeometry(k, numVerts);
+		g.flags = (k == REM_OPAQUE) ? VK_GEOMETRY_OPAQUE_BIT_KHR : 0;
+		VkBuildAccelerationStructureFlagsKHR flags = remBlasFlags(k);
+		if (flags & VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR)
+		{
+			VkAccelerationStructureBuildGeometryInfoKHR bi = {VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR,
+			                                                   .type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR, .flags = flags,
+			                                                   .mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR, .geometryCount = 1, .pGeometries = &g};
+			VkAccelerationStructureBuildSizesInfoKHR sizes = {VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR};
+			vkGetAccelerationStructureBuildSizesKHR(R.dev, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &bi, &count, &sizes);
+			updScratch = (sizes.updateScratchSize > updScratch) ? sizes.updateScratchSize : updScratch;
+		}
+		cmdBegin();
+		buildBlas(&R.remBlas[k], &g, count, count, flags);
+		cmdSubmitWait();
+	}
+	if (updScratch)
+	{
+		// refit scratch of its own (the refits take turns): the frame's builds use the shared one
+		R.remUpdScratch = bufCreate(updScratch + R.asProps.minAccelerationStructureScratchOffsetAlignment, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, DEVICE_LOCAL);
+	}
+	snprintf(R.remKey, sizeof(R.remKey), "%s", key);
+	struct stat st;
+	R.remStamp[0] = (stat(path, &st) == 0) ? (uint64_t)st.st_size : 0;
+	R.remStamp[1] = (stat(path, &st) == 0) ? (uint64_t)st.st_mtime : 0;
+	R.remActive = 1;
+	R.hdr->remasterActive = 1;
+	remWriteSet();
+	logf_("remaster %s: %u verts, triangles %u opaque, %u alpha tested, %u grass (%s), %u decals, %u animated (%u parts), %u proxy (%u slots), %u textures (%.0f MB), "
+	      "%u lights, sky %s in %.0f ms", key, numVerts, R.remStart[1] - R.remStart[0], R.remStart[2] - R.remStart[1], R.remStart[3] - R.remStart[2],
+	      R.remWind ? "wind" : "still", R.remStart[4] - R.remStart[3], R.remStart[5] - R.remStart[4], R.remNumParts, R.remStart[6] - R.remStart[5],
+	      R.remNumSlots, numTex, texBytes / 1e6, R.remNumLights, skySize ? "cube" : "PS1", nowMs() - t0);
+}
+
+// this frame's proxy slot matrices: the n-th instance of a model the game
+// reports takes that model's slot with copy n (none: all zero, its triangles
+// collapse)
+static void remProxyFrame(const struct RtxHeader *H, float out[RTX_MAX_PROXY][3][4])
+{
+	memset(out, 0, sizeof(float) * RTX_MAX_PROXY * 12);
+	uint32_t np = (H->numProxy > RTX_MAX_PROXY) ? RTX_MAX_PROXY : H->numProxy;
+	for (uint32_t s = 0; R.remActive && (s < R.remNumSlots); s++)
+	{
+		int seen = 0;
+		for (uint32_t i = 0; i < np; i++)
+		{
+			const struct RtxProxyInst *p = &H->proxy[i];
+			if ((p->model != R.remSlots[s].model) || (seen++ != R.remSlots[s].copy))
+			{
+				continue;
+			}
+			for (int r = 0; r < 3; r++)
+			{
+				for (int c = 0; c < 3; c++)
+				{
+					out[s][r][c] = p->m[r * 3 + c];
+				}
+				out[s][r][3] = p->t[r];
+			}
+			break;
+		}
+	}
+}
+
+// the dynamic vertices: wind.comp moves grass by the wind, animated nodes by
+// their keys and proxies by their instances, then their BLASes are refit
+// (proxies: rebuilt, they travel); recorded into the frame's command buffer
+// before the TLAS build
+static void remWindUpdate(void)
+{
+	if (!R.remActive || !R.remDyn)
+	{
+		return;
+	}
+	uint32_t n = R.remNumVerts - R.remGrassVert;
+	vkCmdBindPipeline(R.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, R.pipeWind);
+	vkCmdDispatch(R.cmd, (n + 63) / 64, 1, 1);
+	barrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+	        VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR | VK_ACCESS_SHADER_READ_BIT);
+	static const int groups[3] = {REM_GRASS, REM_ANIM, REM_PROXY};
+	for (int i = 0; i < 3; i++)
+	{
+		int k = groups[i];
+		uint32_t count = R.remStart[k + 1] - R.remStart[k];
+		if (!count || !R.remBlas[k].as)
+		{
+			continue;
+		}
+		VkAccelerationStructureGeometryKHR g = remGeometry(k, R.remNumVerts);
+		if (k == REM_PROXY)
+		{
+			buildBlas(&R.remBlas[k], &g, count, count, remBlasFlags(k));
+		}
+		else
+		{
+			VkAccelerationStructureBuildGeometryInfoKHR bi = {VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR,
+			                                                   .type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR,
+			                                                   .flags = remBlasFlags(k),
+			                                                   .mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR,
+			                                                   .srcAccelerationStructure = R.remBlas[k].as,
+			                                                   .dstAccelerationStructure = R.remBlas[k].as,
+			                                                   .geometryCount = 1,
+			                                                   .pGeometries = &g};
+			VkDeviceSize align = R.asProps.minAccelerationStructureScratchOffsetAlignment;
+			bi.scratchData.deviceAddress = (R.remUpdScratch.addr + align - 1) & ~(align - 1);
+			VkAccelerationStructureBuildRangeInfoKHR range = {.primitiveCount = count};
+			const VkAccelerationStructureBuildRangeInfoKHR *pr = &range;
+			vkCmdBuildAccelerationStructuresKHR(R.cmd, 1, &bi, &pr);
+		}
+		// (scratch reused by the next one; the TLAS reads them all)
+		barrier(VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR, VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR,
+		        VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+		        VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR | VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR);
+	}
+}
+
+// baked mode (ray tracing off on an NF track): the light at every remaster
+// vertex, once per track: from rtbake/<key>.rembake if made for this .rtxm
+// (and as many vertices), else rembake.comp in chunks with last frame's
+// constants and sets (its lights, sun, sky), then saved there
+#define REMBAKE_CHUNK 65536u
+static void remBakeRun(void)
+{
+	uint32_t n = R.remNumVerts;
+	VkDeviceSize bytes = (VkDeviceSize)n * 16;
+	if (!R.remBake.buf)
+	{
+		R.remBake = bufCreate(bytes, USAGE_STORAGE, DEVICE_LOCAL);
+		remWriteSet();
+	}
+	char path[1400];
+	snprintf(path, sizeof(path), "%s/rtbake", s_exeDir);
+	mkdir(path, 0755);
+	snprintf(path, sizeof(path), "%s/rtbake/%s.rembake", s_exeDir, R.remKey);
+	uint64_t head[4] = {0x4B42524D, n, R.remStamp[0], R.remStamp[1]}; // "MRBK"
+	Buf stage = bufCreate(bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, HOST_MEM);
+	FILE *f = fopen(path, "rb");
+	uint64_t got[4] = {0};
+	int cached = f && (fread(got, sizeof(got), 1, f) == 1) && !memcmp(got, head, sizeof(head)) && (fread(stage.map, 1, bytes, f) == bytes);
+	if (f)
+	{
+		fclose(f);
+	}
+	double t0 = nowMs();
+	if (cached)
+	{
+		cmdBegin();
+		copyBuf(&stage, &R.remBake, bytes);
+		cmdSubmitWait();
+	}
+	else
+	{
+		VkDescriptorSet *sets = R.sets[R.parity];
+		for (uint32_t first = 0; first < n; first += REMBAKE_CHUNK)
+		{
+			uint32_t count = (n - first < REMBAKE_CHUNK) ? n - first : REMBAKE_CHUNK;
+			int32_t pcFirst = (int32_t)first;
+			cmdBegin();
+			vkCmdBindPipeline(R.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, R.pipeRemBake);
+			vkCmdBindDescriptorSets(R.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, R.pipeLayout, 1, 1, &R.remSet, 0, NULL);
+			vkCmdBindDescriptorSets(R.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, R.pipeLayout, 0, 1, &sets[PASS_TRACE], 0, NULL);
+			vkCmdPushConstants(R.cmd, R.pipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, 4, &pcFirst);
+			vkCmdDispatch(R.cmd, (count + 63) / 64, 1, 1);
+			cmdSubmitWait();
+		}
+		cmdBegin();
+		VkBufferCopy c = {0, 0, bytes};
+		vkCmdCopyBuffer(R.cmd, R.remBake.buf, stage.buf, 1, &c);
+		cmdSubmitWait();
+		f = fopen(path, "wb");
+		if (f)
+		{
+			fwrite(head, sizeof(head), 1, f);
+			fwrite(stage.map, 1, bytes, f);
+			fclose(f);
+		}
+	}
+	bufDestroy(&stage);
+	R.remBaked = 1;
+	logf_("baked mode %s: %u vertices %s in %.0f ms", R.remKey, n, cached ? "read from its cache" : "baked", nowMs() - t0);
 }
 
 // ---- lights file -------------------------------------------------------------------
