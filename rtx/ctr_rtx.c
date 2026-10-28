@@ -2663,10 +2663,142 @@ static void levelPrep(void)
 			      l < R.numFileLights ? "file" : (l < firstHot ? "glow" : "pool"), d[0], d[1], d[2], d[4], d[5], d[6], d[7]);
 		}
 	}
-	logf_("lights: %u from file, %u glowing surfaces, %u lamp pools", R.numFileLights, R.numGlowLights, numHot);
+	logf_("lights: %u from file, %u glowing surfaces, %u lamp pools%s", R.numFileLights, R.numGlowLights, numHot,
+	      R.remActive ? " (NF: the PS1 level's lava, measured; replaced by the NF lava lights)" : "");
+	if (R.remActive)
+	{
+		logf_("NF lights: %u, lava ones x %.2f, tint %.2f %.2f %.2f (the stock lava's fitted light %.3g, NF's own near it %.3g)", R.remNumLights, lavaScale,
+		      lavaTint[0], lavaTint[1], lavaTint[2], ps1Lava, nfLavaPower);
+	}
+	// (a GL bake keeps the art's colour where it glows or moves, or nothing lights)
+	free(s_bakeKeep);
+	s_bakeKeep = malloc(nv ? nv : 1);
+	for (uint32_t v = 0; v < nv; v++)
+	{
+		s_bakeKeep[v] = !used[v];
+	}
+	for (uint32_t i = 0; i < nt; i++)
+	{
+		if (tris[i].flags & (RTX_TRI_EMISSIVE | RTX_TRI_ANIMATED | RTX_TRI_WATER))
+		{
+			for (int c = 0; c < 3; c++)
+			{
+				s_bakeKeep[tris[i].v[c]] = 1;
+			}
+		}
+	}
 	free(used);
 	free(tris);
 	R.levelPrep = 0;
+}
+
+static float linSrgb(float c)
+{
+	return powf(fmaxf(c, 0.0f), 1.0f / 2.2f);
+}
+
+static int cmpFloatAsc(const void *a, const void *b)
+{
+	float x = *(const float *)a, y = *(const float *)b;
+	return (x > y) - (x < y);
+}
+
+// Settings "Bake now": the prepared level's ray traced lighting as vertex
+// colours for the GL renderer (players without ray tracing). bake.comp again,
+// with the fitted sun, sky and lights and hdr->bakeRays rays per term; each
+// vertex's light x the art's tint (as the traced surfaces have it), exposed so
+// the level's median brightness stays the art's (as auto exposure matches the
+// PS1 frame), back to the PS1 vertex colour scale (0x80 = 1.0)
+static void bakeVertexLight(void)
+{
+	uint32_t nv = R.hdr->numLevelVerts;
+	const struct RtxLevelVert *verts = (const void *)(R.shm + RTX_OFF_LEVEL_VERTS);
+	uint32_t *out = (uint32_t *)(R.shm + RTX_OFF_BAKE_OUT);
+	double t0 = nowMs();
+	FrameData *F = R.frame.map;
+	prepLightingConstants(F);
+	F->counts[0] = R.numLights;
+	F->counts[1] = nv;
+	uint32_t rays = R.hdr->bakeRays ? R.hdr->bakeRays : 64u;
+	F->feat[3] = rays;
+	// (in pieces: one long dispatch could trip the driver's watchdog)
+	const uint32_t chunk = 2048;
+	for (uint32_t first = 0; first < nv; first += chunk)
+	{
+		F->feat[2] = first;
+		cmdBegin();
+		copyBuf(&R.lightsStage, &R.lights, (VkDeviceSize)R.numLights * 48);
+		buildLevelOnlyTlas();
+		barrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
+		dispatchOnce(R.pipeBake, (((nv - first) < chunk ? (nv - first) : chunk) + 63) / 64, 0);
+		cmdSubmitWait();
+	}
+	F->feat[2] = F->feat[3] = 0;
+
+	const float *bake = R.bake.map, *tint = R.levelTintStage.map, *lightData = R.lightsStage.map;
+	const struct RtxLighting *L = &R.light;
+	float *lin = malloc(sizeof(float) * 3 * (nv ? nv : 1));
+	float *lumA = malloc(sizeof(float) * (nv ? nv : 1)), *lumB = malloc(sizeof(float) * (nv ? nv : 1));
+	uint32_t nl = 0;
+	for (uint32_t v = 0; v < nv; v++)
+	{
+		const float *b = &bake[v * BAKE_STRIDE];
+		float pred[3];
+		for (int k = 0; k < 3; k++)
+		{
+			pred[k] = b[0] * (L->indoor ? 0.0f : L->sunColor[k]) + b[1 + k] + b[4 + k];
+		}
+		for (uint32_t k = 0; k < BAKE_K; k++)
+		{
+			uint32_t j;
+			memcpy(&j, &b[BAKE_LIGHTS + k * 2], 4);
+			if ((j == 0) || (j > R.numLights))
+			{
+				break;
+			}
+			for (int ch = 0; ch < 3; ch++)
+			{
+				pred[ch] += b[BAKE_LIGHTS + 1 + k * 2] * lightData[(j - 1) * 12 + 4 + ch];
+			}
+		}
+		for (int k = 0; k < 3; k++)
+		{
+			lin[v * 3 + k] = tint[v * 4 + k] * pred[k];
+		}
+		if (!s_bakeKeep[v] && (tint[v * 4 + 3] <= 0.0f))
+		{
+			float c[3];
+			vertLinColor(&verts[v], c);
+			lumA[nl] = luma3(c);
+			lumB[nl] = luma3(&lin[v * 3]);
+			nl++;
+		}
+	}
+	float expo = 1.0f;
+	if (nl > 0)
+	{
+		qsort(lumA, nl, sizeof(float), cmpFloatAsc);
+		qsort(lumB, nl, sizeof(float), cmpFloatAsc);
+		expo = (lumB[nl / 2] > 1e-5f) ? lumA[nl / 2] / lumB[nl / 2] : 1.0f;
+	}
+	for (uint32_t v = 0; v < nv; v++)
+	{
+		uint32_t rgb = verts[v].rgba & 0xffffffu;
+		if (!s_bakeKeep[v] && (tint[v * 4 + 3] <= 0.0f))
+		{
+			rgb = 0;
+			for (int k = 0; k < 3; k++)
+			{
+				float c = linSrgb(lin[v * 3 + k] * expo) * 128.0f + 0.5f;
+				rgb |= (uint32_t)(c < 0.0f ? 0.0f : (c > 255.0f ? 255.0f : c)) << (8 * k);
+			}
+		}
+		out[v] = rgb | 0xff000000u;
+	}
+	free(lin);
+	free(lumA);
+	free(lumB);
+	logf_("baked %u vertices for the GL renderer (%u rays a term, exposure %.2f, %.0f ms)", nv, rays, expo, nowMs() - t0);
 }
 
 // ---- per-pixel buffers ------------------------------------------------------------------
@@ -2675,7 +2807,7 @@ static void levelPrep(void)
 static void resize(uint32_t inW, uint32_t inH, uint32_t w, uint32_t h)
 {
 	vkDeviceWaitIdle(R.dev);
-	Buf *bufs[] = {&R.albedo, &R.geo[0], &R.geo[1], &R.hist[0], &R.hist[1], &R.histDyn[0], &R.histDyn[1], &R.moments[0], &R.moments[1], &R.reservoir[0], &R.reservoir[1], &R.combined, &R.filterA, &R.filterB, &R.layer, &R.disp, &R.spec[0], &R.spec[1], &R.fog[0], &R.fog[1]};
+	Buf *bufs[] = {&R.albedo, &R.geo[0], &R.geo[1], &R.hist[0], &R.hist[1], &R.histDyn[0], &R.histDyn[1], &R.moments[0], &R.moments[1], &R.reservoir[0], &R.reservoir[1], &R.combined, &R.filterA, &R.filterB, &R.layer, &R.disp, &R.spec[0], &R.spec[1], &R.fog[0], &R.fog[1], &R.layerHist[0], &R.layerHist[1]};
 	for (unsigned i = 0; i < sizeof(bufs) / sizeof(*bufs); i++)
 	{
 		bufDestroy(bufs[i]);
@@ -3472,6 +3604,30 @@ int main(int argc, char **argv)
 	while (!R.hdr->quit)
 	{
 		uint32_t req = R.hdr->frameReq;
+		if ((R.hdr->bakeReq != R.hdr->bakeDone) && (req == lastDone))
+		{
+			// a GL lighting bake (the game waits on bakeDone, not on frames)
+			uint32_t bakeReq = R.hdr->bakeReq;
+			__sync_synchronize();
+			R.hdr->rendererBusy = 1;
+			loadLevel();
+			if (R.outW == 0)
+			{
+				resize(64, 48, 64, 48); // (no frame yet: the passes' buffers, for the descriptor sets)
+			}
+			vkDeviceWaitIdle(R.dev);
+			writeSets();
+			setsDirty = 0;
+			levelPrep();
+			bakeVertexLight();
+			R.haveLevel = 0; // (the next frame's level is loaded again)
+			R.hdr->rendererBusy = 0;
+			__sync_synchronize();
+			R.hdr->bakeDone = bakeReq;
+			futexWake(&R.hdr->bakeDone);
+			idleSince = nowMs();
+			continue;
+		}
 		if (req == lastDone)
 		{
 			if (nowMs() - idleSince > 1000.0)

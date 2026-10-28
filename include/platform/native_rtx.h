@@ -19,6 +19,7 @@ enum RtxTag
 	RTX_TAG_INSTANCE, // model instances: captured into dynamic triangles
 	RTX_TAG_SHADOW,   // kart blob shadows: dropped (real shadows instead)
 	RTX_TAG_DEPTH,    // GL drawn, constant view z (particles)
+	RTX_TAG_OVERLAY,  // GL drawn over everything, nothing captured (the checkered flag, loading text)
 };
 
 enum RtxPacketClass

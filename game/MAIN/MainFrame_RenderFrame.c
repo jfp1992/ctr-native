@@ -18,6 +18,7 @@ void MainFrame_RenderFrame(struct GameTracker *gGT, struct GamepadSystem *gGamep
 	struct Level *lev = gGT->level1;
 	struct mesh_info *ptr_mesh_info = 0;
 
+	Rtx_BakeFrame();  // MultiTrack: baked ray traced lighting while the GL renderer draws the level
 	Rtx_FrameBegin(); // MultiTrack: ray tracing capture
 
 	MAINFRAME_PERF_BEGIN(NATIVE_PERF_BUCKET_MAINFRAME_SETUP);
@@ -237,7 +238,9 @@ void MainFrame_RenderFrame(struct GameTracker *gGT, struct GamepadSystem *gGamep
 	MAINFRAME_PERF_BEGIN(NATIVE_PERF_BUCKET_MAINFRAME_UI);
 	if ((gGT->renderFlags & RENDER_FLAG_CHECKERED_FLAG) != 0)
 	{
+		Rtx_BeginTag(RTX_TAG_OVERLAY, &gGT->backBuffer->primMem); // MultiTrack: over the traced image, no depth test
 		RaceFlag_DrawSelf();
+		Rtx_EndTag(&gGT->backBuffer->primMem);
 	}
 
 	RenderDispEnv_UI(gGT);

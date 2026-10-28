@@ -4,6 +4,8 @@
 // cone rays; sky/ambient: 32 cosine rays; static lights in its grid cell: 2
 // rays each). ctr_rtx.c fits the sources' strengths to the vertex colours with
 // these (fitArt) and keeps what they can't explain as the art's tint.
+// Baking the GL renderer's lighting (bakeVertexLight) runs it again with the
+// fitted lights, F.feat.w rays for every term, F.feat.z vertices on.
 
 #include "common.glsl"
 
@@ -16,7 +18,8 @@ const uint BAKE_K = 48u;
 
 void main()
 {
-	uint v = gl_GlobalInvocationID.x;
+	uint v = gl_GlobalInvocationID.x + F.feat.z;
+	uint sunRays = (F.feat.w > 0u) ? F.feat.w : 8u, skyRays = (F.feat.w > 0u) ? F.feat.w : 32u, lightRays = (F.feat.w > 0u) ? F.feat.w : 2u;
 	if (v >= F.counts.y)
 	{
 		return;
@@ -45,7 +48,7 @@ void main()
 	float sun = 0.0;
 	if (F.ambient.w < 0.5)
 	{
-		for (int i = 0; i < 8; i++)
+		for (uint i = 0u; i < sunRays; i++)
 		{
 			vec3 l = coneSample(F.sunDir.xyz, F.sunDir.w, rng);
 			float ndl = dot(n, l);
@@ -54,13 +57,13 @@ void main()
 				sun += ndl;
 			}
 		}
-		sun /= 8.0;
+		sun /= float(sunRays);
 	}
 	// sky / ambient where the hemisphere is open; where it isn't, light bounced
 	// off the surface it meets, as bright as the art paints that surface
 	vec3 sky = vec3(0.0), bounce = vec3(0.0);
 	float aoRadius = (F.ambient.w > 0.5) ? F.params.x : 1e7;
-	for (int i = 0; i < 32; i++)
+	for (uint i = 0u; i < skyRays; i++)
 	{
 		vec3 d = cosineSample(n, rng);
 		uint inst, prim;
@@ -77,8 +80,8 @@ void main()
 			bounce += srgbToLinear(c);
 		}
 	}
-	sky /= 32.0;
-	bounce /= 32.0;
+	sky /= float(skyRays);
+	bounce /= float(skyRays);
 	bake[base] = sun;
 	bake[base + 1u] = sky.r;
 	bake[base + 2u] = sky.g;
@@ -105,7 +108,7 @@ void main()
 			continue;
 		}
 		float g = 0.0;
-		for (int s = 0; s < 2; s++)
+		for (uint s = 0u; s < lightRays; s++)
 		{
 			float u = rnd(rng) * 2.0 - 1.0, phi = 6.28318530718 * rnd(rng);
 			vec3 target = l0.xyz + vec3(sqrt(1.0 - u * u) * cos(phi), u, sqrt(1.0 - u * u) * sin(phi)) * l2.x;
@@ -118,7 +121,7 @@ void main()
 				g += ndl * lightFalloff(dist * dist, l1.w);
 			}
 		}
-		g *= 0.5;
+		g /= float(lightRays);
 		if (g > 1e-4)
 		{
 			bake[base + 8u + written * 2u] = uintBitsToFloat(j + 1u);
