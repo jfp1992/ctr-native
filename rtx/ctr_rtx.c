@@ -15,6 +15,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <math.h>
+#include <setjmp.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -27,6 +28,10 @@
 #include <time.h>
 #include <unistd.h>
 
+// (a remaster mesh being loaded, loadRemaster: a failure, out of memory most
+// likely, gives up that mesh instead of the renderer)
+static jmp_buf *s_softFail;
+
 #define CHECK(x)                                                                              \
 	do                                                                                        \
 	{                                                                                         \
@@ -34,6 +39,8 @@
 		if (r_ != VK_SUCCESS)                                                                 \
 		{                                                                                     \
 			fprintf(stderr, "[ctr_rtx] %s failed: %d (%s:%d)\n", #x, r_, __FILE__, __LINE__); \
+			if (s_softFail)                                                                   \
+				longjmp(*s_softFail, 1);                                                      \
 			exit(1);                                                                          \
 		}                                                                                     \
 	} while (0)
@@ -185,6 +192,7 @@ static struct
 	VkQueue queue;
 	uint32_t queueFamily;
 	VkPhysicalDeviceMemoryProperties memProps;
+	int memBudget; // VK_EXT_memory_budget (memLog)
 	VkPhysicalDeviceAccelerationStructurePropertiesKHR asProps;
 	VkCommandPool pool;
 	VkCommandBuffer cmd;
@@ -459,7 +467,10 @@ static void initVulkan(void)
 	uint32_t n = 8;
 	VkPhysicalDevice devs[8];
 	CHECK(vkEnumeratePhysicalDevices(R.instance, &n, devs));
-	const char *exts[] = {VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME, VK_KHR_RAY_QUERY_EXTENSION_NAME, VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME};
+	// (the fourth, optional: memory use for the per-level log, memLog)
+	const char *exts[] = {VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME, VK_KHR_RAY_QUERY_EXTENSION_NAME, VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME,
+	                      VK_EXT_MEMORY_BUDGET_EXTENSION_NAME};
+	int budget = 0;
 	// discrete GPU first (the AMD iGPU also has ray queries under RADV)
 	for (uint32_t pass = 0; pass < 2 && !R.phys; pass++)
 	for (uint32_t i = 0; i < n && !R.phys; i++)
@@ -486,10 +497,16 @@ static void initVulkan(void)
 				}
 			}
 		}
+		int hasBudget = 0;
+		for (uint32_t k = 0; k < ne; k++)
+		{
+			hasBudget |= !strcmp(ep[k].extensionName, exts[3]);
+		}
 		free(ep);
 		if (found == 3)
 		{
 			R.phys = devs[i];
+			budget = hasBudget;
 		}
 	}
 	if (!R.phys)
