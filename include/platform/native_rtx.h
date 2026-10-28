@@ -56,6 +56,8 @@ void Rtx_BakeShutdown(void);
 // ray tracing off: the level lit from its lightmap, baked by the renderer
 int Rtx_LightmapBakeProgress(void); // 0..100 while the level's bakes (the game stands still), -1 not baking
 void Rtx_LightmapRebake(void);      // every level's again
+int Rtx_LightmapState(void);        // the level's: 0 none, 1 baking, 2 ready (rtx_shared.h RTX_LM_*)
+void Rtx_HoldOff(int hold);         // ray tracing off meanwhile, settings.ini untouched
 
 // game hooks
 void Rtx_FrameBegin(void);

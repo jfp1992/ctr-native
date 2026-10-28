@@ -4,7 +4,8 @@
 // Settings, Back / Right goes back to the menu. Settings: resolution, fullscreen, ray tracing on/off and its
 // samples per pixel, an FPS counter (platform/native_overlay.c), baked ray
 // tracing (platform/native_rtx_bake.c: the GL
-// renderer draws levels with their baked lighting) and baking it. They are
+// renderer draws levels with their baked lighting) and baking it ("Bake now";
+// on a ray tracing GPU every track's lightmap, MT_BakeTour in MultiTrack.c). They are
 // saved to settings.ini (platform/native_settings.c) and stay in step with the
 // F12 overlay / F7 / F11 (same state underneath).
 
@@ -232,7 +233,7 @@ static void MT_Settings_DrawPanel(struct GameTracker *gGT)
 		int ry = y + titleH + i * rowH + 2;
 		int color = MT_Settings_RowLocked(i) ? 0x17 : ORANGE;
 		MT_Settings_ValueText(i, value, sizeof(value));
-		DecalFont_DrawLine(((i == MT_ROW_BAKE_NOW) && Rtx_Supported()) ? "REBAKE LIGHT" : labels[i], x + 8, ry, FONT_BIG, color);
+		DecalFont_DrawLine(labels[i], x + 8, ry, FONT_BIG, color);
 		// (a resolution picked but not applied yet: in white)
 		int pending = (i == MT_ROW_RESOLUTION) && (s_mtSet.pendingMode != MT_Settings_CurrentMode());
 		DecalFont_DrawLine(value, x + MT_SET_PANEL_W - 8, ry, FONT_BIG, JUSTIFY_RIGHT | (pending ? WHITE : color));
@@ -285,9 +286,9 @@ static void MT_Settings_DrawConfirm(struct GameTracker *gGT)
 {
 	if (Rtx_Supported())
 	{
-		char *rebake[] = {"BAKE THE LIGHT AGAIN", "WITH RAY TRACING OFF EVERY LEVEL", "BAKES ITS LIGHT AGAIN", "THE NEXT TIME IT LOADS."};
-		char *choices[] = {"NO", "YES"};
-		MT_Settings_DrawMessage(gGT, rebake, 4, choices, 2, s_mtSet.confirmYes);
+		char *tour[] = {"BAKE RAY TRACED LIGHT", "EVERY TRACK LOADS IN TURN AND", "BAKES ITS LIGHT (SECONDS EACH).", "TRIANGLE STOPS AFTER A TRACK."};
+		char *choices[] = {"NO", "NOT BAKED YET", "ALL AGAIN"};
+		MT_Settings_DrawMessage(gGT, tour, 4, choices, 3, s_mtSet.confirmYes);
 		return;
 	}
 	char *lines[] = {"BAKE RAY TRACED LIGHTING", "FOR EVERY LEVEL NOT BAKED YET.", "THIS CAN TAKE A LONG TIME",
@@ -394,7 +395,8 @@ static void MT_Settings_ConfirmInput(int tap)
 {
 	if (tap & (BTN_UP | BTN_DOWN | BTN_LEFT | BTN_RIGHT))
 	{
-		s_mtSet.confirmYes ^= 1;
+		int n = Rtx_Supported() ? 3 : 2; // (ray tracing GPU: no / not baked yet / all again)
+		s_mtSet.confirmYes = (s_mtSet.confirmYes + ((tap & (BTN_UP | BTN_LEFT)) ? n - 1 : 1)) % n;
 		OtherFX_Play(0, 1);
 	}
 	else if (tap & (BTN_TRIANGLE | BTN_SQUARE_one))
@@ -407,9 +409,9 @@ static void MT_Settings_ConfirmInput(int tap)
 		OtherFX_Play(1, 1);
 		if (s_mtSet.confirmYes && Rtx_Supported())
 		{
-			Rtx_LightmapRebake();
-			s_mtSet.bakeTotal = 1;
-			s_mtSet.focus = MT_SET_PANEL;
+			NativeSettings_Save();
+			s_mtSet.focus = MT_SET_NONE;
+			MT_BakeTour_Start(s_mtSet.confirmYes == 2);
 		}
 		else if (s_mtSet.confirmYes)
 		{
@@ -456,10 +458,20 @@ void MT_Settings_Tick(struct GameTracker *gGT)
 	}
 
 	// test harness: CTR_TEST_BAKE=1 runs "Bake now" once the main menu is up
+	// (a ray tracing GPU: the tour, CTR_TEST_BAKE=2 all again)
 	static int s_testBake = -1;
 	if (s_testBake < 0)
 		s_testBake = getenv("CTR_TEST_BAKE") != NULL;
-	if ((s_testBake == 1) && Rtx_Supported() && !Rtx_BakeRunning())
+	if ((s_testBake == 1) && Rtx_Supported())
+	{
+		if (MT_Settings_OnMainMenu())
+		{
+			s_testBake = 2;
+			MT_BakeTour_Start(atoi(getenv("CTR_TEST_BAKE")) == 2);
+			return;
+		}
+	}
+	else if ((s_testBake == 1) && !Rtx_BakeRunning())
 	{
 		s_testBake = 2;
 		Rtx_BakeStart();

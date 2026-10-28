@@ -2625,7 +2625,30 @@ int Rtx_LightmapBakeProgress(void)
 	return ((RTX_HDR != NULL) && RTX_HDR->rendererReady && !s_rtx.enabled && (RTX_HDR->lmState == RTX_LM_BAKING)) ? (int)RTX_HDR->lmProgress : -1;
 }
 
-// Settings "Rebake light": every level's lightmap is baked again (the renderer
+// the level's lightmap: RTX_LM_NONE (not drawn with one, or not yet), _BAKING, _READY
+int Rtx_LightmapState(void)
+{
+	return ((RTX_HDR != NULL) && RTX_HDR->rendererReady) ? (int)RTX_HDR->lmState : RTX_LM_NONE;
+}
+
+// Settings "Bake now" (MT_BakeTour): ray tracing off for its levels, without
+// touching settings.ini; back as it was after
+void Rtx_HoldOff(int hold)
+{
+	static int s_was = -1;
+	if (hold && (s_was < 0))
+	{
+		s_was = s_rtx.enabled;
+		s_rtx.enabled = 0;
+	}
+	else if (!hold && (s_was >= 0))
+	{
+		s_rtx.enabled = s_was;
+		s_was = -1;
+	}
+}
+
+// Settings "Bake now", all again: every level's lightmap is baked again (the renderer
 // deletes them; the level loaded now starts again)
 void Rtx_LightmapRebake(void)
 {

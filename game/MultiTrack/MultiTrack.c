@@ -106,18 +106,130 @@ int MT_ShotClean(void)
 	return s_clean;
 }
 
-// once a frame (RenderAllHUD): with ray tracing off, while the level's light
-// bakes (the game standing still), how far it is
-void MT_LightBakeTick(void)
+// ---- Settings "Bake now": every track's light, one after the other -----------
+// Each race and battle track (stock, then the table's custom and NF tracks; 1P
+// detail) is loaded as an arcade race with ray tracing held off: its lightmap
+// bakes as on any first load (the game standing still, the level's objects in
+// place), the next one loads once it's ready, then back to the title. Already
+// baked ones are read from their cache and passed after a moment. Adventure
+// hubs bake when first visited (they can't be loaded straight away).
+#define MT_TOUR_STOCK      (LAB_BASEMENT + 1) // (race tracks, then battle arenas)
+#define MT_TOUR_READY_WAIT 20                 // frames shown after its light is ready
+#define MT_TOUR_GIVE_UP    300                // frames with no lightmap at all (NF: lit from its own bake)
+
+static struct
 {
-	int pct = Rtx_LightmapBakeProgress();
-	if (pct < 0)
+	int active, stopping;
+	int cur, total;
+	int frames; // in the current level
+} s_tour;
+
+static void MT_BakeTour_Load(int k)
+{
+	struct GameTracker *gGT = sdata->gGT;
+	struct MTHeader *table = MT_Table();
+	if (k < MT_TOUR_STOCK)
+	{
+		gMTState.redirectLevel = -1;
+		gMTState.entry = 0;
+		printf("[MultiTrack] bake: level %d of %d, stock %d\n", k + 1, s_tour.total, k);
+		MainRaceTrack_RequestLoad((s16)k);
+	}
+	else
+	{
+		const struct MTEntry *e = &table->entries[k - MT_TOUR_STOCK];
+		gMTState.magic = MT_MAGIC;
+		gMTState.redirectLevel = e->slot;
+		gMTState.redirectBase = e->bigBase;
+		gMTState.entry = (short)(k - MT_TOUR_STOCK + 1);
+		printf("[MultiTrack] bake: level %d of %d, '%s' on slot %d\n", k + 1, s_tour.total, e->name, e->slot);
+		MainRaceTrack_RequestLoad((s16)e->slot);
+	}
+	gGT->numPlyrNextGame = 1;
+	s_tour.frames = 0;
+}
+
+// from the main menu's title (Settings)
+void MT_BakeTour_Start(int again)
+{
+	struct GameTracker *gGT = sdata->gGT;
+	if (again)
+	{
+		Rtx_LightmapRebake(); // (the renderer drops them all before the first level)
+	}
+	Rtx_HoldOff(1);
+	s_tour.active = 1;
+	s_tour.stopping = 0;
+	s_tour.cur = 0;
+	s_tour.total = MT_TOUR_STOCK + MT_Table()->count;
+	const char *cap = getenv("CTR_TEST_BAKE_COUNT"); // (test harness: only the first n levels)
+	s_tour.total = (cap && (atoi(cap) > 0) && (atoi(cap) < s_tour.total)) ? atoi(cap) : s_tour.total;
+	// (as the title's demo race starts one)
+	MM_Title_CameraReset();
+	MM_Title_KillThread();
+	gGT->gameMode1 &= ~(BATTLE_MODE | ADVENTURE_MODE | TIME_TRIAL | ADVENTURE_ARENA | ARCADE_MODE | ADVENTURE_CUP);
+	gGT->gameMode2 &= ~(CUP_ANY_KIND);
+	gGT->gameMode1 |= ARCADE_MODE;
+	MT_BakeTour_Load(0);
+	RECTMENU_Hide(&D230.menuMainMenu);
+}
+
+int MT_BakeTour_Active(void)
+{
+	return s_tour.active;
+}
+
+static void MT_BakeTour_Tick(void)
+{
+	struct GameTracker *gGT = sdata->gGT;
+	if (!s_tour.active || (sdata->Loading.stage != LOAD_IDLE) || (gGT->level1 == NULL))
 	{
 		return;
 	}
-	char buf[32];
-	snprintf(buf, sizeof(buf), "BAKING LIGHT %d%%", pct);
-	DecalFont_DrawLine(buf, 256, 100, FONT_BIG, JUSTIFY_CENTER | ORANGE);
+	s_tour.stopping |= (sdata->AnyPlayerTap & BTN_TRIANGLE) != 0;
+	s_tour.frames++;
+	int state = Rtx_LightmapState();
+	int done = ((state == 2) && (s_tour.frames > MT_TOUR_READY_WAIT)) || ((state == 0) && (s_tour.frames > MT_TOUR_GIVE_UP));
+	if (!done || (state == 1))
+	{
+		return;
+	}
+	if (!s_tour.stopping && (s_tour.cur + 1 < s_tour.total))
+	{
+		MT_BakeTour_Load(++s_tour.cur);
+		return;
+	}
+	// back to the title (as the pause menu's Quit)
+	printf("[MultiTrack] bake: done (%d of %d levels)\n", s_tour.cur + 1, s_tour.total);
+	s_tour.active = 0;
+	Rtx_HoldOff(0);
+	gMTState.redirectLevel = -1;
+	gMTState.entry = 0;
+	gGT->gameMode1 &= ~ARCADE_MODE;
+	sdata->Loading.OnBegin.AddBitsConfig0 |= MAIN_MENU;
+	sdata->Loading.OnBegin.RemBitsConfig0 |= ADVENTURE_ARENA;
+	GAME_MAIN_MENU_STATE = MAIN_MENU_TITLE;
+	MainRaceTrack_RequestLoad(MAIN_MENU_LEVEL);
+}
+
+// once a frame (RenderAllHUD): with ray tracing off, while the level's light
+// bakes (the game standing still), how far it is; the "Bake now" tour
+void MT_LightBakeTick(void)
+{
+	MT_BakeTour_Tick();
+	int pct = Rtx_LightmapBakeProgress();
+	char buf[48];
+	if (pct >= 0)
+	{
+		snprintf(buf, sizeof(buf), "BAKING LIGHT %d%%", pct);
+		DecalFont_DrawLine(buf, 256, 100, FONT_BIG, JUSTIFY_CENTER | ORANGE);
+	}
+	if (s_tour.active)
+	{
+		snprintf(buf, sizeof(buf), "LEVEL %d OF %d", s_tour.cur + 1, s_tour.total);
+		DecalFont_DrawLine(buf, 256, 120, FONT_SMALL, JUSTIFY_CENTER | WHITE);
+		DecalFont_DrawLine(s_tour.stopping ? "STOPPING AFTER THIS LEVEL" : "TRIANGLE: STOP AFTER THIS LEVEL", 256, 132, FONT_SMALL, JUSTIFY_CENTER | WHITE);
+	}
 }
 
 // once a frame (RenderAllHUD): the intro fly-by over (the race HUD would

@@ -79,6 +79,8 @@ int MT_BootLevel(int defaultLevel);
 int MT_ShotClean(void);
 void MT_ShotTick(void);
 void MT_LightBakeTick(void);
+void MT_BakeTour_Start(int again); // Settings "Bake now": every track's light (again: the baked ones too)
+int MT_BakeTour_Active(void);
 struct GameTracker;
 void MT_Settings_Tick(struct GameTracker *gGT); // main menu Settings (MT_Settings.c), before the menu's input
 int MT_Settings_HidesMenu(void);                // Settings open: no menu under it this frame
