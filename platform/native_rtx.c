@@ -79,6 +79,8 @@ struct RtxEmitter
 	float color[3]; // weighted sum
 	float weight;
 	float radius;
+	const void *inst;  // the model instance it glows on (NULL: particles); a cluster: its first
+	float instPos[3];  // where that instance stands
 };
 
 struct RtxCapEntry
@@ -142,17 +144,31 @@ static struct
 		u16 seen;     // frames seen in the same place
 		u8 moving;    // moved since first seen (kart flames): never remembered
 		u8 matched;   // seen this frame
+		const void *inst;     // the model it glows on (save screens, warp pads): still while that stays put
+		float instAnchor[3];  // where that model stood when first seen
 	} remembered[128];
 	int worldCapture; // record GTE projections outside tags (skidmarks, effects) for the overlay depth test
 	int numLevelCap;  // level polygons of this frame's OT walk (the renderer gets them next frame)
 	u16 capSerial;    // key of the projections being recorded: instance serial, 0 = world
-	u32 otBase;       // pushBuffer[0] ordering table (0x400 buckets) and the UI one, this frame
+	u32 otBase[RTX_MAX_VIEWS]; // each player's ordering table (0x400 buckets) and the UI one, this frame
 	u32 uiOtStart, uiOtEnd;
+	// split screen: every view draws every model it sees; the first view to
+	// draw one traces it, the others only hand it over (GL skips it there too)
+	struct
+	{
+		const void *key;
+		u32 gen;
+		int view;
+	} drawnBy[1024];
+	int dupDraw; // the instance being drawn was traced from another view this frame
+	int rtxOnly; // the instance being drawn is outside the view: the PS1 draws none of it, the ray tracer all
+	int tagDynStart; // dynamic triangles before the open instance tag (its culled triangles are added while it draws)
 
 	// GL overlay depth: context of the packet being parsed
 	int ctxActive;
-	int ctxWorld;  // last OT entry walked was pushBuffer[0]'s
+	int ctxWorld;  // last OT entry walked was a player's view's
 	int ctxBucket; // its index
+	int ctxView;   // that view
 	u16 ctxSerial;
 	float ctxZ;
 	// bucket -> view z, fitted from model packets (OT index ~ z / 64)
@@ -195,6 +211,8 @@ static struct
 	} kartBody[16];
 	int numKartBody;
 	const void *curKart;   // instance being captured is a driver's body
+	const struct Instance *curInst; // instance being captured (its glows know their source)
+	const struct Instance *emitInst; // source of the emitters being added now
 	const void *curWheels; // wheel range being captured: of this driver instance
 	struct
 	{
@@ -215,14 +233,24 @@ static struct
 	int numAnimRect;
 
 	// capture statistics (CTR_RTX_DEBUG), model packets this frame
-	int statCaptured, statNoProj, statSemi, statInstances;
+	int statCaptured, statNoProj, statSemi, statInstances, statCulledTris;
 	// emitter statistics (CTR_RTX_DEBUG): instances by mode, candidates by source / fate
 	// (summed over the 300 frames between reports)
-	int statInstMode[3], statEmitGlow, statEmitSemi, statEmitOpaque, statEmitParticle, statEmitGrey, statEmitDim, statEmitNoProj;
+	int curModelId;            // Model.id of the instance being drawn (-1: none)
+	int statGlLeftModel[256];  // (debug) instances by Model.id partly left GL drawn
+	int statInstMode[4], statEmitGlow, statEmitSemi, statEmitOpaque, statEmitParticle, statEmitGrey, statEmitDim, statEmitNoProj;
 	int statPartAdditive, statPartVivid, statPartWhite, statPartDull, statPartNoTex;
 	int statPolyNoTex, statPolyNotGlow, statEmitAdded, statEmitFull, statLights;
 	int statMemMoved, statMemGone, statMemOld;
 } s_rtx;
+
+// Ctrl+F6 (or CTR_RTX_PROBE_FRAME=n): one frame described in rtx_probe.txt
+// next to the executable; the renderer adds what its camera rays hit there
+static struct
+{
+	int want;    // asked for: the next published frame
+	int pending; // published: its karts against the traced depth when the image is back
+} s_probe;
 
 #define RTX_MASK_ALL 0xffffffffu
 
@@ -528,6 +556,7 @@ void Rtx_BeginTag(int tag, struct PrimMem *primMem)
 	s_rtx.tagDepth++;
 	if (tag == RTX_TAG_INSTANCE)
 	{
+		s_rtx.tagDynStart = s_rtx.numDyn;
 		s_rtx.serial++;
 		if ((s_rtx.serial == 0) || (s_rtx.serial == RTX_LEVEL_SERIAL))
 		{
@@ -2289,6 +2318,126 @@ static u32 Rtx_CapturePacketTo(u32 *words, int numWords, u16 serial, int allowSe
 	return (left == 0) ? RTX_MASK_ALL : mask;
 }
 
+// ---- model triangles the PS1 culls ---------------------------------------------
+// The PS1 draws a model's front faces in view only: back faces (NCLIP), the
+// triangles off screen or behind the camera, whole models outside the view
+// never become packets. The ray tracer wants them all (shadows of what is
+// behind the camera, reflections, the far side of a kart a light falls on,
+// glows out of view): the model renderer hands each such triangle here, from
+// its model-space corners and the GTE's model -> view transform; GL draws none
+
+int Rtx_WantsCulledTris(void)
+{
+	return (RTX_HDR != NULL) && Rtx_Drawing() && RTX_HDR->rendererReady && s_rtx.levelValid;
+}
+
+void Rtx_SetRtxOnlyInstance(int on)
+{
+	s_rtx.rtxOnly = on;
+}
+
+int Rtx_RtxOnlyInstance(void)
+{
+	return s_rtx.rtxOnly;
+}
+
+static int Rtx_AverageTexels(u16 tpage, u16 clut, const u8 (*uv)[2], int n, float *avg);
+static void Rtx_AddEmitter(const float *pos, const float *color, float weight, float radius, int glowModel);
+
+void Rtx_CaptureCulledTri(const u32 *gteRT, const u32 *packedXY, const u32 *packedZ, int textured, const u32 *texWords, const int *colors)
+{
+	if (!Rtx_WantsCulledTris() || (s_rtx.tagDepth <= 0) || (s_rtx.tagStack[s_rtx.tagDepth - 1] != RTX_TAG_INSTANCE) || s_rtx.dupDraw)
+	{
+		return;
+	}
+	int mode = s_rtx.instMode;
+	if ((mode == RTX_INST_GL) || (mode == RTX_INST_HIDE))
+	{
+		return;
+	}
+	// GTE rotation (RT11..RT33, 4.12) and translation; view = TR + RT . v / 4096
+	s16 rt[9] = {(s16)gteRT[0], (s16)(gteRT[0] >> 16), (s16)gteRT[1], (s16)(gteRT[1] >> 16), (s16)gteRT[2], (s16)(gteRT[2] >> 16),
+	             (s16)gteRT[3], (s16)(gteRT[3] >> 16), (s16)gteRT[4]};
+	float pos[3][3];
+	for (int v = 0; v < 3; v++)
+	{
+		float m[3] = {(float)(s16)packedXY[v], (float)(s16)(packedXY[v] >> 16), (float)(s16)packedZ[v]};
+		float view[3];
+		for (int r = 0; r < 3; r++)
+		{
+			view[r] = ((float)(s32)gteRT[5 + r] + (rt[r * 3] * m[0] + rt[r * 3 + 1] * m[1] + rt[r * 3 + 2] * m[2]) / 4096.0f) * s_rtx.instScale;
+		}
+		Rtx_ViewToWorld(view, pos[v]);
+	}
+	u8 uv[3][2] = {{0, 0}, {0, 0}, {0, 0}};
+	u16 clut = 0, tpage = 0;
+	if (textured)
+	{
+		for (int v = 0; v < 3; v++)
+		{
+			uv[v][0] = (u8)texWords[v];
+			uv[v][1] = (u8)(texWords[v] >> 8);
+		}
+		clut = (u16)(texWords[0] >> 16);
+		tpage = (u16)(texWords[1] >> 16);
+	}
+	// (as the PS1 would: semi-transparent when its texture page blends)
+	int semi = textured && (((tpage >> 5) & 3) != 3);
+	if ((mode == RTX_INST_GLOW) || semi)
+	{
+		// a glow out of view still lights (as Rtx_EmitterPacket)
+		float tex[3] = {1, 1, 1}, c[3] = {0, 0, 0}, centre[3] = {0, 0, 0}, radius = 0.0f;
+		if (textured && !Rtx_AverageTexels(tpage, clut, (const u8(*)[2])uv, 3, tex))
+		{
+			return;
+		}
+		for (int v = 0; v < 3; v++)
+		{
+			for (int k = 0; k < 3; k++)
+			{
+				c[k] += (u8)(colors[v] >> (k * 8)) / 128.0f / 3.0f;
+				centre[k] += pos[v][k] / 3.0f;
+			}
+		}
+		for (int k = 0; k < 3; k++)
+		{
+			c[k] *= tex[k];
+		}
+		for (int v = 0; v < 3; v++)
+		{
+			float dx = pos[v][0] - centre[0], dy = pos[v][1] - centre[1], dz = pos[v][2] - centre[2];
+			radius = fmaxf(radius, sqrtf(dx * dx + dy * dy + dz * dz));
+		}
+		float mx = fmaxf(c[0], fmaxf(c[1], c[2])), mn = fminf(c[0], fminf(c[1], c[2]));
+		int vivid = (mx >= 0.5f) && ((mx - mn) >= 0.35f * mx);
+		if ((mode == RTX_INST_GLOW) || (((tpage >> 5) & 3) == 1) || vivid)
+		{
+			Rtx_AddEmitter(centre, c, 0.5f + radius * radius / 1500.0f, radius, mode == RTX_INST_GLOW);
+		}
+		return;
+	}
+	if (s_rtx.numDyn >= (int)RTX_MAX_DYN_TRIS)
+	{
+		return;
+	}
+	struct RtxDynTri *d = &Rtx_DynTris()[s_rtx.numDyn++];
+	for (int v = 0; v < 3; v++)
+	{
+		memcpy(d->p[v], pos[v], sizeof(d->p[v]));
+		d->uv[v][0] = uv[v][0];
+		d->uv[v][1] = uv[v][1];
+		d->col[v][0] = (u8)colors[v];
+		d->col[v][1] = (u8)(colors[v] >> 8);
+		d->col[v][2] = (u8)(colors[v] >> 16);
+		d->col[v][3] = 0xff;
+	}
+	d->clut = clut;
+	d->tpage = tpage;
+	d->flags = textured ? RTX_TRI_TEXTURED : 0;
+	d->object = s_rtx.serial;
+	s_rtx.statCulledTris++;
+}
+
 // ---- emitters: glowing (additive) things become point lights ---------------
 
 static u16 Rtx_Vram16(int x, int y)
@@ -2402,6 +2551,12 @@ static void Rtx_AddEmitter(const float *pos, const float *color, float weight, f
 	}
 	e->weight = weight;
 	e->radius = radius;
+	const struct Instance *src = s_rtx.emitInst;
+	e->inst = src;
+	for (int i = 0; i < 3; i++)
+	{
+		e->instPos[i] = src ? (float)src->matrix.t[i] : 0.0f;
+	}
 }
 
 // additive-blended polygons of a model packet (turbo flames, fire, glows)
@@ -2515,7 +2670,8 @@ static void Rtx_EmitterPacket(u32 *words, int numWords, u16 serial, int anyBlend
 
 void Rtx_OnParticle(struct PushBuffer *pb, s32 viewX4, s32 viewY4, s32 viewZ4, u32 color, const struct Icon *icon)
 {
-	if ((RTX_HDR == NULL) || !s_rtx.enabled || (pb != &sdata->gGT->pushBuffer[0]) || (icon == NULL))
+	s_rtx.emitInst = NULL; // (particles: no model of their own)
+	if ((RTX_HDR == NULL) || !Rtx_Drawing() || (Rtx_PbView(pb) < 0) || (icon == NULL))
 	{
 		return;
 	}
@@ -2561,7 +2717,14 @@ void Rtx_OnParticle(struct PushBuffer *pb, s32 viewX4, s32 viewY4, s32 viewZ4, u
 // behind the camera) for up to 30 s, until it is on screen nearby and not seen
 // (gone out). Lights that move (karts' flames) are this frame's only. Writes
 // the strongest (by brightness at the camera) of both into out
-static int Rtx_RememberLights(const struct RtxPointLight *cur, int numCur, struct RtxPointLight *out, int maxOut)
+// Glows on a model (save screens, warp pads, lamps on scenery) go by that model:
+// still while it stays put, from the first sight however the lit part of it
+// moves about (an animated screen), kept until the level changes or it should be
+// on screen and isn't drawn (collected, gone)
+static int Rtx_InstDrawnThisFrame(const void *inst);
+
+static int Rtx_RememberLights(const struct RtxPointLight *cur, const void *const *curInst, const float (*curInstPos)[3], int numCur, struct RtxPointLight *out,
+                              int maxOut)
 {
 	const int numMem = (int)(sizeof(s_rtx.remembered) / sizeof(s_rtx.remembered[0]));
 	// (a glow's centre jumps around from frame to frame: flicker, sparks; what
@@ -2587,9 +2750,21 @@ static int Rtx_RememberLights(const struct RtxPointLight *cur, int numCur, struc
 		const struct RtxPointLight *l = &cur[c];
 		int best = -1;
 		float bestD2 = matchDist * matchDist;
-		for (int m = 0; m < numMem; m++)
+		float instD2 = 1e30f;
+		for (int m = 0; (m < numMem) && curInst[c]; m++)
 		{
-			if ((mem[m].seen == 0) || mem[m].matched)
+			if ((mem[m].seen != 0) && !mem[m].matched && (mem[m].inst == curInst[c]))
+			{
+				// (its model's glow; of several, the nearest)
+				float dx = mem[m].pos[0] - l->pos[0], dy = mem[m].pos[1] - l->pos[1], dz = mem[m].pos[2] - l->pos[2];
+				float d2 = dx * dx + dy * dy + dz * dz;
+				best = (d2 < instD2) ? m : best;
+				instD2 = (d2 < instD2) ? d2 : instD2;
+			}
+		}
+		for (int m = 0; (m < numMem) && (best < 0); m++)
+		{
+			if ((mem[m].seen == 0) || mem[m].matched || (mem[m].inst != curInst[c]))
 			{
 				continue;
 			}
@@ -2624,10 +2799,18 @@ static int Rtx_RememberLights(const struct RtxPointLight *cur, int numCur, struc
 			mem[best].falloff = l->falloff;
 			mem[best].size = l->size;
 			mem[best].levelGen = levelGen;
+			mem[best].inst = curInst[c];
+			memcpy(mem[best].instAnchor, curInstPos[c], sizeof(mem[best].instAnchor));
 		}
 		struct RtxRememberedLight *r = &mem[best];
 		float ax = l->pos[0] - r->anchor[0], ay = l->pos[1] - r->anchor[1], az = l->pos[2] - r->anchor[2];
 		int moved = (r->seen < staticFrames) && (ax * ax + ay * ay + az * az > moveDist * moveDist);
+		if (r->inst)
+		{
+			// on a model: moved when the model has
+			float mx = curInstPos[c][0] - r->instAnchor[0], my = curInstPos[c][1] - r->instAnchor[1], mz = curInstPos[c][2] - r->instAnchor[2];
+			moved = (mx * mx + my * my + mz * mz > 50.0f * 50.0f);
+		}
 		s_rtx.statMemMoved += moved && !r->moving;
 		r->moving |= moved;
 		float k = r->moving ? 1.0f : 0.15f; // static: smoothed (the flames flicker, their light less)
@@ -2641,13 +2824,21 @@ static int Rtx_RememberLights(const struct RtxPointLight *cur, int numCur, struc
 		r->seen = (r->seen < 60000) ? r->seen + 1 : r->seen;
 		r->lastGen = s_rtx.gen;
 		r->matched = 1;
-		fromMem[c] = !r->moving && (r->seen >= staticFrames);
+		fromMem[c] = !r->moving && ((r->seen >= staticFrames) || r->inst);
 	}
 
 	// candidates: this frame's moving / new ones, every static remembered one
-	float cam[3];
+	// the players' cameras (split screen: the nearest one counts)
+	int numCams = (s_rtx.numViews > 0) ? s_rtx.numViews : 1;
+	float cam[RTX_MAX_VIEWS][3];
 	const float zero[3] = {0, 0, 0};
-	Rtx_ViewToWorld(zero, cam);
+	int viewWas = s_rtx.view;
+	for (int v = 0; v < numCams; v++)
+	{
+		s_rtx.view = v;
+		Rtx_ViewToWorld(zero, cam[v]);
+	}
+	s_rtx.view = viewWas;
 	static struct RtxPointLight cand[RTX_MAX_DYN_LIGHTS * 4 + 128];
 	static float score[RTX_MAX_DYN_LIGHTS * 4 + 128];
 	int numCand = 0;
@@ -2658,11 +2849,10 @@ static int Rtx_RememberLights(const struct RtxPointLight *cur, int numCur, struc
 			cand[numCand++] = cur[c];
 		}
 	}
-	const float *R = RTX_HDR->camR, *T = RTX_HDR->camT;
 	for (int m = 0; m < numMem; m++)
 	{
 		struct RtxRememberedLight *r = &mem[m];
-		if ((r->seen < staticFrames) || r->moving)
+		if (((r->seen < staticFrames) && !r->inst) || r->moving)
 		{
 			// not (yet) static: forget it soon after it's gone
 			r->seen = ((r->seen != 0) && (s_rtx.gen - r->lastGen > 30u)) ? 0 : r->seen;
@@ -2670,15 +2860,35 @@ static int Rtx_RememberLights(const struct RtxPointLight *cur, int numCur, struc
 		}
 		if (!r->matched)
 		{
-			// unseen: gone out if it should be on screen nearby, forgotten after a while
-			float v[3];
-			for (int i = 0; i < 3; i++)
+			// unseen: gone out if it should be on screen nearby (in any player's
+			// view), forgotten after a while
+			int onScreen = 0;
+			for (int view = 0; view < numCams; view++)
 			{
-				v[i] = R[i * 3] * r->pos[0] + R[i * 3 + 1] * r->pos[1] + R[i * 3 + 2] * r->pos[2] + T[i];
+				const struct RtxView *rv = &RTX_HDR->views[view];
+				const float *R = rv->camR, *T = rv->camT;
+				float v[3];
+				for (int i = 0; i < 3; i++)
+				{
+					v[i] = R[i * 3] * r->pos[0] + R[i * 3 + 1] * r->pos[1] + R[i * 3 + 2] * r->pos[2] + T[i];
+				}
+				float sx = (v[2] > 1.0f) ? v[0] / v[2] * rv->projH : 1e9f, sy = (v[2] > 1.0f) ? v[1] / v[2] * rv->projH : 1e9f;
+				onScreen |= (v[2] > 100.0f) && (v[2] < 2500.0f) && (fabsf(sx) < 0.4f * rv->vpW) && (fabsf(sy) < 0.4f * rv->vpH);
 			}
-			float sx = (v[2] > 1.0f) ? v[0] / v[2] * RTX_HDR->projH : 1e9f, sy = (v[2] > 1.0f) ? v[1] / v[2] * RTX_HDR->projH : 1e9f;
-			int onScreen = (v[2] > 100.0f) && (v[2] < 2500.0f) && (fabsf(sx) < 0.4f * RTX_HDR->vpW) && (fabsf(sy) < 0.4f * RTX_HDR->vpH);
-			if ((onScreen && (s_rtx.gen - r->lastGen > 4u)) || (s_rtx.gen - r->lastGen > forgetFrames))
+			// (a model's: as long as the level lasts; gone out when the model is on
+			// screen and not drawn, not when it is drawn without its glow this
+			// frame, an animated screen's dark frame)
+			// a model's glow (a level object's: the game culls it by its own bounds,
+			// so "on screen" says nothing): out when the game hides the object
+			// (collected, broken) or draws it a while without this glow (it moved
+			// elsewhere on it); a model that isn't the level's own (another hub's,
+			// a weapon) after the usual while
+			int drawn = r->inst && Rtx_InstDrawnThisFrame(r->inst);
+			int levelObj = r->inst && Rtx_IsLevelInstance(r->inst);
+			int goneOut = r->inst ? ((levelObj && (((const struct Instance *)r->inst)->flags & HIDE_MODEL)) || (drawn && (s_rtx.gen - r->lastGen > 15u)) ||
+			                         (!levelObj && (s_rtx.gen - r->lastGen > forgetFrames)))
+			                      : (onScreen && (s_rtx.gen - r->lastGen > 4u));
+			if (goneOut || (!r->inst && (s_rtx.gen - r->lastGen > forgetFrames)))
 			{
 				s_rtx.statMemGone += onScreen;
 				s_rtx.statMemOld += !onScreen;
@@ -2698,9 +2908,14 @@ static int Rtx_RememberLights(const struct RtxPointLight *cur, int numCur, struc
 	for (int c = 0; c < numCand; c++)
 	{
 		const struct RtxPointLight *l = &cand[c];
-		float dx = l->pos[0] - cam[0], dy = l->pos[1] - cam[1], dz = l->pos[2] - cam[2];
+		float d2 = 1e30f;
+		for (int v = 0; v < numCams; v++)
+		{
+			float dx = l->pos[0] - cam[v][0], dy = l->pos[1] - cam[v][1], dz = l->pos[2] - cam[v][2];
+			d2 = fminf(d2, dx * dx + dy * dy + dz * dz);
+		}
 		float reach = 3.0f * l->falloff;
-		score[c] = (l->color[0] + l->color[1] + l->color[2]) / (1.0f + (dx * dx + dy * dy + dz * dz) / (reach * reach));
+		score[c] = (l->color[0] + l->color[1] + l->color[2]) / (1.0f + d2 / (reach * reach));
 	}
 	int n = 0;
 	while ((n < maxOut) && (n < numCand))
@@ -2737,7 +2952,7 @@ static void Rtx_BuildDynLights(void)
 		{
 			const struct RtxEmitter *k = &clusters[c];
 			float dx = k->pos[0] / k->weight - e->pos[0], dy = k->pos[1] / k->weight - e->pos[1], dz = k->pos[2] / k->weight - e->pos[2];
-			if (dx * dx + dy * dy + dz * dz < mergeDist * mergeDist)
+			if ((k->inst == e->inst) && (dx * dx + dy * dy + dz * dz < mergeDist * mergeDist)) // (one model's glows: not a passing kart's flame)
 			{
 				best = c;
 				break;
@@ -2751,6 +2966,8 @@ static void Rtx_BuildDynLights(void)
 			}
 			best = numClusters++;
 			memset(&clusters[best], 0, sizeof(clusters[best]));
+			clusters[best].inst = e->inst;
+			memcpy(clusters[best].instPos, e->instPos, sizeof(e->instPos));
 		}
 		struct RtxEmitter *k = &clusters[best];
 		for (int j = 0; j < 3; j++)
@@ -2779,11 +2996,15 @@ static void Rtx_BuildDynLights(void)
 	// this frame's lights: colour = average colour of what glows; more glowing
 	// stuff = brighter
 	static struct RtxPointLight cur[RTX_MAX_DYN_LIGHTS * 4];
+	static const void *curInst[RTX_MAX_DYN_LIGHTS * 4];
+	static float curInstPos[RTX_MAX_DYN_LIGHTS * 4][3];
 	int numCur = numClusters;
 	for (int c = 0; c < numCur; c++)
 	{
 		const struct RtxEmitter *k = &clusters[c];
 		struct RtxPointLight *l = &cur[c];
+		curInst[c] = k->inst;
+		memcpy(curInstPos[c], k->instPos, sizeof(curInstPos[c]));
 		memset(l, 0, sizeof(*l));
 		float strength = 1.2f * sqrtf(k->weight);
 		strength = strength > 6.0f ? 6.0f : strength;
@@ -2795,7 +3016,7 @@ static void Rtx_BuildDynLights(void)
 		l->falloff = 300.0f + 4.0f * k->radius;
 		l->size = 10.0f + 0.25f * k->radius;
 	}
-	int n = Rtx_RememberLights(cur, numCur, RTX_HDR->dynLights, (int)RTX_MAX_DYN_LIGHTS);
+	int n = Rtx_RememberLights(cur, curInst, (const float(*)[3])curInstPos, numCur, RTX_HDR->dynLights, (int)RTX_MAX_DYN_LIGHTS);
 	RTX_HDR->numDynLights = (u32)n;
 	s_rtx.statLights += n;
 }
@@ -2872,13 +3093,14 @@ static void Rtx_CaptureSmoke(u32 *packet, int lengthWords, float z)
 	}
 	float pos[4][3];
 	u8 uv[4][2];
-	for (int v = 0; v < 4; v++)
+	for (int k = 0; k < 4; k++)
 	{
-		u32 xy = packet[2 + v * 2], t = packet[3 + v * 2];
-		float view[3] = {((s16)(xy & 0xffff) - s_rtx.partOfx) * z / s_rtx.partH, ((s16)(xy >> 16) - s_rtx.partOfy) * z / s_rtx.partH, z};
-		Rtx_ViewToWorld(view, pos[v]);
-		uv[v][0] = (u8)t;
-		uv[v][1] = (u8)(t >> 8);
+		// (the view's projection, not corner k's: other views' are 0 in single player)
+		u32 xy = packet[2 + k * 2], t = packet[3 + k * 2];
+		float view[3] = {((s16)(xy & 0xffff) - s_rtx.partOfx[v]) * z / s_rtx.partH[v], ((s16)(xy >> 16) - s_rtx.partOfy[v]) * z / s_rtx.partH[v], z};
+		Rtx_ViewToWorld(view, pos[k]);
+		uv[k][0] = (u8)t;
+		uv[k][1] = (u8)(t >> 8);
 	}
 	static const int triIdx[2][3] = {{0, 1, 2}, {1, 3, 2}};
 	for (int t = 0; t < 2; t++)
@@ -3047,8 +3269,9 @@ int Rtx_RenderFrame(int outW, int outH, const u8 **rgba, const float **depth)
 		       cam[2], RTX_HDR->renderMs, RTX_HDR->traceSpp);
 		printf("[RTX]   models: %d instances, polygons %d traced, %d unprojected (GL), %d see-through (GL); %d level polygons\n", s_rtx.statInstances,
 		       s_rtx.statCaptured, s_rtx.statNoProj, s_rtx.statSemi, RTX_HDR->numLevelCap);
-		printf("[RTX]   (last 300 frames) instances: %d traced, %d glowing, %d GL only; emitter candidates: %d glow-model polys, %d see-through, %d opaque (skipped), %d particles, %d no projection; rejected %d grey, %d dim\n",
-		       s_rtx.statInstMode[RTX_INST_CAPTURE], s_rtx.statInstMode[RTX_INST_GLOW], s_rtx.statInstMode[RTX_INST_GL], s_rtx.statEmitGlow, s_rtx.statEmitSemi,
+		printf("[RTX]   models: %d triangles the PS1 culled traced (back faces, off screen, models out of view)\n", s_rtx.statCulledTris);
+		printf("[RTX]   (last 300 frames) instances: %d traced, %d glowing, %d GL only, %d hidden (remaster); emitter candidates: %d glow-model polys, %d see-through, %d opaque (skipped), %d particles, %d no projection; rejected %d grey, %d dim\n",
+		       s_rtx.statInstMode[RTX_INST_CAPTURE], s_rtx.statInstMode[RTX_INST_GLOW], s_rtx.statInstMode[RTX_INST_GL], s_rtx.statInstMode[RTX_INST_HIDE], s_rtx.statEmitGlow, s_rtx.statEmitSemi,
 		       s_rtx.statEmitOpaque, s_rtx.statEmitParticle, s_rtx.statEmitNoProj, s_rtx.statEmitGrey, s_rtx.statEmitDim);
 		printf("[RTX]   particles: %d additive, %d vivid, %d white, %d dull (no light), %d no texels\n", s_rtx.statPartAdditive, s_rtx.statPartVivid,
 		       s_rtx.statPartWhite, s_rtx.statPartDull, s_rtx.statPartNoTex);
@@ -3069,9 +3292,28 @@ int Rtx_RenderFrame(int outW, int outH, const u8 **rgba, const float **depth)
 		s_rtx.statGapSum = s_rtx.statGapAbs = 0.0;
 		printf("[RTX]   glows tracked %d: %d static (remembered), %d moving; %d moved / %d forgotten on screen / %d timed out (last 300 frames)\n", tracked, remembered, moving,
 		       s_rtx.statMemMoved, s_rtx.statMemGone, s_rtx.statMemOld);
+		for (int m = 0; m < (int)(sizeof(s_rtx.remembered) / sizeof(s_rtx.remembered[0])); m++)
+		{
+			const struct RtxRememberedLight *r = &s_rtx.remembered[m];
+			if (r->seen != 0)
+			{
+				printf("[RTX]     glow at %.0f %.0f %.0f colour %.2f %.2f %.2f: seen %u frames, %s, last seen %u frames ago\n", r->pos[0], r->pos[1], r->pos[2],
+				       r->color[0], r->color[1], r->color[2], r->seen, r->moving ? "moving" : "still", s_rtx.gen - r->lastGen);
+			}
+		}
 		s_rtx.statMemMoved = s_rtx.statMemGone = s_rtx.statMemOld = 0;
 		s_rtx.statPolyNoTex = s_rtx.statPolyNotGlow = s_rtx.statEmitAdded = s_rtx.statEmitFull = s_rtx.statLights = 0;
 		memset(s_rtx.statInstMode, 0, sizeof(s_rtx.statInstMode));
+		printf("[RTX]   models partly GL drawn (id x instances):");
+		for (int m = 0; m < 256; m++)
+		{
+			if (s_rtx.statGlLeftModel[m])
+			{
+				printf(" %d x%d", m, s_rtx.statGlLeftModel[m]);
+			}
+		}
+		printf("\n");
+		memset(s_rtx.statGlLeftModel, 0, sizeof(s_rtx.statGlLeftModel));
 		s_rtx.statEmitGlow = s_rtx.statEmitSemi = s_rtx.statEmitOpaque = s_rtx.statEmitParticle = s_rtx.statEmitGrey = s_rtx.statEmitDim = s_rtx.statEmitNoProj = 0;
 		s_rtx.statPartAdditive = s_rtx.statPartVivid = s_rtx.statPartWhite = s_rtx.statPartDull = s_rtx.statPartNoTex = 0;
 		for (int i = 0; i < (int)RTX_HDR->numDynLights && i < 8; i++)
