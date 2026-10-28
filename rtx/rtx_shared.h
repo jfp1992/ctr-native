@@ -113,19 +113,32 @@ struct RtxPointLight
 };
 
 #define RTX_MAX_LIGHTS 1024u
+#define RTX_MAX_PROXY  8u
+
+struct RtxProxyInst
+{
+	int32_t model;  // Model.id
+	float m[9];     // world = m * model + t (row-major, scale included)
+	float t[3];
+	int32_t pad[3];
+};
 
 // renderer settings: the game's F12 overlay (keys 1-8) and CTR_RTX_* env vars;
 // the renderer reads them every frame
+#define RTX_MIN_SPP  4u
+#define RTX_MAX_SPP  64u
+#define RTX_SPP_STEP 4u
 struct RtxSettings
 {
 	uint32_t renderScale; // percent of the output size that is traced (TAA upscales)
-	uint32_t quality;     // samples per pixel preset: 0 low 2, 1 medium 4, 2 high 8, 3 ultra 16
-	float budgetMs;       // trace pass ceiling: only ever lowers the preset's samples
+	uint32_t spp;         // samples per pixel (RTX_MIN_SPP..RTX_MAX_SPP): the trace pass's target
+	float budgetMs;       // trace pass ceiling, 0 = off: only ever lowers spp
 	uint32_t taa;         // temporal anti-aliasing / upscaling of the final image
 	uint32_t texFilter;   // bilinear PS1 texels on camera hits (colour key aware)
 	uint32_t specular;    // GGX highlights and reflections on every material
 	uint32_t fog;         // height / distance haze and sun shafts
 	uint32_t pipelined;   // renderer a frame behind the game (one frame of latency)
+	uint32_t baked;       // ray tracing off on a Nitro-Fueled track: its mesh lit by light baked once per track, no live rays
 };
 
 // renderer pass timings (ms, averaged), RtxHeader.passMs
@@ -187,6 +200,16 @@ struct RtxHeader
 	volatile uint32_t quit;
 	volatile uint32_t frameTaken; // renderer: input of frameReq copied (the game may write the next frame's)
 	volatile uint32_t rendererBusy; // renderer: loading / preparing a level (the game waits longer)
+	volatile uint32_t remasterActive; // renderer: a remaster mesh (assets/rtx_remaster) is traced in the level's place
+	volatile int16_t remasterHide[8]; // renderer: PS1 model ids it replaces (the game draws none of them), 0 = none
+	volatile int16_t remasterProxy[4]; // renderer: PS1 model ids it draws as remaster models where the game has them (proxy[]), 0 = none
+	// baked lighting for the GL renderer (Settings "Bake now"): the game uploads
+	// a level and bumps bakeReq; the renderer prepares it, traces every vertex
+	// with bakeRays rays per light term and writes its colour to RTX_OFF_BAKE_OUT
+	// (RGBA, PS1 vertex colour scale), then sets bakeDone = bakeReq
+	volatile uint32_t bakeReq;
+	volatile uint32_t bakeDone;
+	uint32_t bakeRays;
 
 	// level (rewritten when levelGen changes)
 	uint32_t levelGen;

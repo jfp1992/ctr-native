@@ -4268,6 +4268,13 @@ static void renderFrame(void)
 	static struct RtxHeader Hsnap;
 	memcpy(&Hsnap, (const void *)R.hdr, sizeof(Hsnap));
 	struct RtxHeader *H = &Hsnap;
+	// baked mode: its light first (a frame in: that frame's constants and sets)
+	int baked = H->settings.baked && R.remActive;
+	if (baked && !R.remBaked && R.havePrev)
+	{
+		remBakeRun();
+	}
+	baked = baked && R.remBaked;
 	uint32_t nd = H->numDynTris;
 	if (nd > RTX_MAX_DYN_TRIS)
 	{

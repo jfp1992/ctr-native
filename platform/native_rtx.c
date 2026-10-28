@@ -649,8 +649,8 @@ void Rtx_FrameBegin(void)
 	}
 	s_rtx.calZ = s_rtx.calB = 0.0;
 	s_rtx.calN = 0;
-	s_rtx.worldCapture = (RTX_HDR != NULL) && s_rtx.enabled && RTX_HDR->rendererReady;
-	s_rtx.statCaptured = s_rtx.statNoProj = s_rtx.statSemi = s_rtx.statInstances = 0;
+	s_rtx.worldCapture = (RTX_HDR != NULL) && Rtx_Drawing() && RTX_HDR->rendererReady;
+	s_rtx.statCaptured = s_rtx.statNoProj = s_rtx.statSemi = s_rtx.statInstances = s_rtx.statCulledTris = 0;
 	s_rtx.capSerial = 0;
 	s_rtx.instScale = 1.0f;
 	g_rtxCapture = s_rtx.worldCapture;
@@ -747,10 +747,45 @@ void Rtx_EndTag(struct PrimMem *primMem)
 
 	// model packets are allocated back to back: decode them now, so the ray
 	// traced image can be rendered before the GL overlay pass draws over it
-	int dynStart = s_rtx.numDyn;
+	// (its culled triangles, Rtx_CaptureCulledTri, came in while it drew)
+	int dynStart = (tag == RTX_TAG_INSTANCE) ? s_rtx.tagDynStart : s_rtx.numDyn;
 	const void *kart = s_rtx.curKart, *wheelsOf = s_rtx.curWheels;
 	s_rtx.curKart = s_rtx.curWheels = NULL;
-	if ((tag == RTX_TAG_INSTANCE) && s_rtx.enabled && RTX_HDR->rendererReady)
+	int dup = s_rtx.dupDraw;
+	s_rtx.dupDraw = 0;
+	s_rtx.emitInst = (tag == RTX_TAG_INSTANCE) ? s_rtx.curInst : NULL;
+	s_rtx.curInst = NULL;
+	int glLeft = 0; // some of the model stays GL drawn
+	if ((tag == RTX_TAG_INSTANCE) && dup && Rtx_Drawing() && RTX_HDR->rendererReady)
+	{
+		// split screen, a model another view traced: GL skips what that view's
+		// copy hands over (decoded only for which commands those are)
+		u32 *p = (u32 *)start;
+		while ((u32)p < end)
+		{
+			int len = getlen(p);
+			if ((len == 0) || (len > 32) || ((u32)(p + 1 + len) > end))
+			{
+				break;
+			}
+			if (r->mode == RTX_INST_HIDE)
+			{
+				Rtx_MarkCaptured((u32)p, RTX_MASK_ALL);
+			}
+			else if (r->mode == RTX_INST_CAPTURE)
+			{
+				static struct RtxDynTri scratch[64];
+				int n = 0;
+				u32 mask = Rtx_CapturePacketTo(p + 1, len, r->serial, r->allowSemi, scratch, &n, 64);
+				if (mask != 0)
+				{
+					Rtx_MarkCaptured((u32)p, mask);
+				}
+			}
+			p += 1 + len;
+		}
+	}
+	else if ((tag == RTX_TAG_INSTANCE) && Rtx_Drawing() && RTX_HDR->rendererReady)
 	{
 		u32 *p = (u32 *)start;
 		while ((u32)p < end)
@@ -3871,6 +3906,7 @@ int Rtx_RenderFrame(int outW, int outH, const u8 **rgba, const float **depth)
 	RTX_HDR->debugView = (u32)s_rtx.debugView;
 	RTX_HDR->lightMode = s_rtx.lightMode ? 0u : 1u; // default full relight, F5 hybrid
 	RTX_HDR->settings = s_rtx.settings;
+	RTX_HDR->settings.baked = !s_rtx.enabled; // (drawing with it off: an NF track, Rtx_Drawing)
 	// pipelined: show the previous request's image (made the same way, at this
 	// size, the game frame before) and only wait for the renderer to take this
 	// frame's input

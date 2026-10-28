@@ -121,11 +121,45 @@ layout(set = 0, binding = 26, std430) readonly buffer CapTris { uint capTris[]; 
 layout(set = 0, binding = 31, std430) readonly buffer LevelTint { vec4 levelTint[]; };   // per vertex: the art's colour beyond the traced light (linear), w glow
 layout(set = 0, binding = 39, std430) readonly buffer BlueNoise { float blueNoise[]; };  // 64x64 void-and-cluster ranks, 0..1
 
+// remaster mesh (a Nitro-Fueled level, scripts/nf_level.py), in the PS1 level's
+// place when the level has one (ctr_rtx.c loadRemaster)
+layout(set = 1, binding = 0, std430) readonly buffer RemVerts { uint remVerts[]; };   // 8 words: pos, uv, octahedral normal, rgba8, 0
+layout(set = 1, binding = 1, std430) readonly buffer RemIdx { uint remIdx[]; };       // 3 per triangle
+layout(set = 1, binding = 2, std430) readonly buffer RemTriMat { uint remTriMat[]; }; // material per triangle
+layout(set = 1, binding = 3, std430) readonly buffer RemMats { uvec4 remMats[]; };    // 3 per material: (tex0, tex1, emission, flags), (normal0, normal1, alphaRef, emission2), tint (directional blends: direction x scale, bias)
+layout(set = 1, binding = 4) uniform sampler2D remTex[1024];
+layout(set = 1, binding = 5) uniform samplerCube remSky;                              // the level's skybox (F.rem.w & 1)
+layout(set = 1, binding = 6, std430) buffer RemGrass { uint remGrass[]; };           // dynamic vertices as wind.comp moved them (grass, animated, proxies): position, normal, tangent (5 words)
+layout(set = 1, binding = 7, std430) readonly buffer RemAnim { uint remAnim[]; };      // moving parts, keys, their vertices, proxy slots (scripts/nf_level.py)
+layout(set = 1, binding = 8, std430) buffer RemBake { vec4 remBake[]; };               // baked mode (F.rem.w & 16): light at each vertex (rembake.comp)
+
 const uint INST_LEVEL = 0u;
 const uint INST_DYN = 1u;
 const uint INST_CAP = 2u; // texture layer only (primary rays): mask 0x4
-const uint MASK_SCENE = 0x3u;
-const uint MASK_FAST = 0xau; // models + the level forced opaque (ctr_rtx.c): bounce rays
+const uint INST_REM = 3u;       // remaster, opaque materials: mask 0x10
+const uint INST_REM_ALPHA = 4u; // remaster, alpha tested / water: mask 0x20 (its triangles from F.rem.x)
+const uint INST_REM_GRASS = 5u; // remaster, grass and foliage, wind-blown: mask 0x20 (from F.rem.y)
+const uint INST_REM_DECAL = 6u; // remaster, decals: mask 0x40, only remDecals looks (from F.rem.z)
+const uint INST_REM_ANIM = 7u;  // remaster, animated nodes (propellers, fans, gears): mask 0x10 (from F.rem3.x)
+const uint INST_REM_PROXY = 8u; // remaster, moving PS1 objects as remaster models: mask 0x10 (from F.rem3.y)
+const uint MASK_SCENE = 0x33u;
+const uint MASK_FAST = 0x1au; // models + the level forced opaque (ctr_rtx.c) + the remaster's opaque part: bounce rays
+
+vec3 srgbToLinear(vec3 c);
+
+const uint MAT_ALPHA_CLIP = 1u, MAT_DECAL = 2u, MAT_WATER = 4u, MAT_BLEND2 = 8u, MAT_UNLIT = 16u, MAT_GRASS = 32u, MAT_NORMAL = 64u, MAT_EMIT = 128u;
+const uint MAT_TRANSLUCENT = 256u, MAT_ICE = 512u, MAT_GLASS = 1024u, MAT_EMIT_MASK = 2048u, MAT_DIRBLEND = 4096u;
+const uint MAT_EMIT_LAYER1 = 8192u, MAT_EMIT_LAYER2 = 16384u; // (nf_level.py: a blended material's one glow mask is that layer's)
+const uint MAT_BLEND_TEX = 32768u; // (nf_level.py: a blended draw with no vertex colours: the first layer's alpha picks the layers)
+const uint MAT_UV_SCROLL2 = 65536u; // (nf_level.py: the second layer's uvs scaled and scrolling, tint.zw half2 scale, scroll per second)
+const uint MAT_EMIT_ALBEDO = 131072u; // (nf_level.py: the emission map is one grey level: the colour glows that much)
+const uint MAT_UV_SCROLL1 = 262144u;  // (nf_level.py: the first layer's uvs scaled and scrolling, tint.xy half2 scale, scroll per second)
+const float RUNNING_LIGHT_BASE = 0.025; // (nf_level.py) a running light's glow between its pulses
+
+// set while lighting a remaster surface: its triangles are dense, their flat
+// faces decide what light reaches them (as for models; the PS1 level is smooth
+// shaded across its big polygons instead, see facesLight)
+bool g_remSurf = false;
 
 // set while tracing a diffuse bounce: its rays (and its hit's shadow rays) see
 // the level as opaque, settled by the RT hardware. Indirect light is soft:
