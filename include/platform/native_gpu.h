@@ -15,6 +15,11 @@ extern DISPENV activeDispEnv;
 extern DRAWENV activeDrawEnv;
 extern int g_GPUDisabledState;
 
+// MultiTrack: the float screen position of a vertex the GTE projected to this
+// integer one (its last), so the GL path draws without the PS1's vertex snapping
+void Pgxp_Record(u32 sxy, float x, float y);
+int Pgxp_Lookup(int x, int y, float *fx, float *fy);
+
 int NativeGpu_HasPendingSplits(void);
 void ClearSplits(void);
 void DrawAllSplits(void);

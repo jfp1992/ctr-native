@@ -327,6 +327,20 @@ void MakeLineArray(GrVertex *vertex, VERTTYPE *p0, VERTTYPE *p1)
 	NativeGpu_RtxDepth(vertex, 4, p0, p1, p1, p0);
 }
 
+// MultiTrack: a polygon corner where the GTE projected it, in float (Pgxp_*:
+// no PS1 vertex snapping), else as the packet has it
+internal void NativeGpu_VertexXY(GrVertex *v, VERTTYPE *p, float ofsX, float ofsY)
+{
+	float fx, fy;
+	if (!Pgxp_Lookup(p[0], p[1], &fx, &fy))
+	{
+		fx = (float)p[0];
+		fy = (float)p[1];
+	}
+	v->x = fx + ofsX;
+	v->y = fy + ofsY;
+}
+
 void MakeVertexTriangle(GrVertex *vertex, VERTTYPE *p0, VERTTYPE *p1, VERTTYPE *p2)
 {
 	assert(p0);
@@ -338,14 +352,9 @@ void MakeVertexTriangle(GrVertex *vertex, VERTTYPE *p0, VERTTYPE *p1, VERTTYPE *
 
 	memset(vertex, 0, sizeof(GrVertex) * 3);
 
-	vertex[0].x = p0[0] + ofsX;
-	vertex[0].y = p0[1] + ofsY;
-
-	vertex[1].x = p1[0] + ofsX;
-	vertex[1].y = p1[1] + ofsY;
-
-	vertex[2].x = p2[0] + ofsX;
-	vertex[2].y = p2[1] + ofsY;
+	NativeGpu_VertexXY(&vertex[0], p0, ofsX, ofsY);
+	NativeGpu_VertexXY(&vertex[1], p1, ofsX, ofsY);
+	NativeGpu_VertexXY(&vertex[2], p2, ofsX, ofsY);
 
 	NativeGpu_RtxDepth(vertex, 3, p0, p1, p2, NULL);
 }
@@ -362,17 +371,10 @@ void MakeVertexQuad(GrVertex *vertex, VERTTYPE *p0, VERTTYPE *p1, VERTTYPE *p2, 
 
 	memset(vertex, 0, sizeof(GrVertex) * 4);
 
-	vertex[0].x = p0[0] + ofsX;
-	vertex[0].y = p0[1] + ofsY;
-
-	vertex[1].x = p1[0] + ofsX;
-	vertex[1].y = p1[1] + ofsY;
-
-	vertex[2].x = p2[0] + ofsX;
-	vertex[2].y = p2[1] + ofsY;
-
-	vertex[3].x = p3[0] + ofsX;
-	vertex[3].y = p3[1] + ofsY;
+	NativeGpu_VertexXY(&vertex[0], p0, ofsX, ofsY);
+	NativeGpu_VertexXY(&vertex[1], p1, ofsX, ofsY);
+	NativeGpu_VertexXY(&vertex[2], p2, ofsX, ofsY);
+	NativeGpu_VertexXY(&vertex[3], p3, ofsX, ofsY);
 
 	NativeGpu_RtxDepth(vertex, 4, p0, p1, p2, p3);
 }
@@ -996,7 +998,7 @@ void DrawAllSplits()
 
 			NATIVE_GPU_LOG("%s\n", "==========================================");
 			NATIVE_GPU_LOG("POLYGON: %d\n", g_dbg_polygonSelected);
-			NATIVE_GPU_LOG("X: %d Y: %d\n", vert->x, vert->y);
+			NATIVE_GPU_LOG("X: %d Y: %d\n", (int)vert->x, (int)vert->y);
 			NATIVE_GPU_LOG("U: %d V: %d\n", vert->u, vert->v);
 			NATIVE_GPU_LOG("TP: %d CLT: %d\n", vert->page, vert->clut);
 

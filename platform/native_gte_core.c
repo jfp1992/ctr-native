@@ -7,6 +7,8 @@
 #include <macros.h>
 #include <psx/gtereg.h>
 #include <psx/libgte.h>
+#include "platform/native_gpu.h"
+#include <math.h>
 
 GTERegisters gteRegs;
 
@@ -318,6 +320,13 @@ internal int GTE_RotTransPers(int idx, int lm)
 	C2_SXY1 = C2_SXY2;
 	C2_SX2 = Lm_G1(F((s64)C2_OFX + ((s64)C2_IR1 * h_over_sz3)) >> 16);
 	C2_SY2 = Lm_G2(F((s64)C2_OFY + ((s64)C2_IR2 * h_over_sz3)) >> 16);
+
+	// MultiTrack: the same projection without its integer steps (GL path: no wobble)
+	if (C2_SZ3 > 0)
+	{
+		double hz = (double)C2_H / (double)C2_SZ3;
+		Pgxp_Record(C2_SXY2, (float)((double)C2_OFX / 65536.0 + C2_IR1 * hz), (float)((double)C2_OFY / 65536.0 + C2_IR2 * hz));
+	}
 
 	// MultiTrack: view-space position behind each projected screen XY (ray tracing capture)
 #ifdef NATIVE_RTX_H
@@ -740,4 +749,42 @@ int GTE_operator(int op)
 	}
 
 	return 0;
+}
+
+// MultiTrack: projected vertices' float screen positions by their integer one
+// (open addressing, overwritten: the latest projection to a spot wins; an
+// entry is only used within a pixel of the integer position asked for)
+#define PGXP_SIZE 65536u
+static struct
+{
+	u32 sxy;
+	float x, y;
+	u8 used;
+} s_pgxp[PGXP_SIZE];
+
+static u32 Pgxp_Hash(u32 sxy)
+{
+	return (sxy * 2654435761u) >> 16;
+}
+
+void Pgxp_Record(u32 sxy, float x, float y)
+{
+	u32 h = Pgxp_Hash(sxy) & (PGXP_SIZE - 1u);
+	s_pgxp[h].sxy = sxy;
+	s_pgxp[h].x = x;
+	s_pgxp[h].y = y;
+	s_pgxp[h].used = 1;
+}
+
+int Pgxp_Lookup(int x, int y, float *fx, float *fy)
+{
+	u32 sxy = ((u32)(u16)(s16)x) | ((u32)(u16)(s16)y << 16);
+	u32 h = Pgxp_Hash(sxy) & (PGXP_SIZE - 1u);
+	if (!s_pgxp[h].used || (s_pgxp[h].sxy != sxy) || (fabsf(s_pgxp[h].x - (float)x) > 1.0f) || (fabsf(s_pgxp[h].y - (float)y) > 1.0f))
+	{
+		return 0;
+	}
+	*fx = s_pgxp[h].x;
+	*fy = s_pgxp[h].y;
+	return 1;
 }

@@ -898,7 +898,8 @@ const char *gte_shader_32_rgba = "	uniform sampler2D s_texture;\n"
 #define GTE_PERSPECTIVE_CORRECTION "	gl_Position = Projection * vec4(a_position.xy, 0.0, 1.0);\n"
 
 #define GTE_VERTEX_SHADER                                                                                          \
-	"	attribute vec4 a_position;\n"                                                                                \
+	"	attribute vec2 a_position;\n"                                                                                \
+	"	attribute vec2 a_pageClut;\n"                                                                                \
 	"	attribute vec4 a_texcoord; // uv, color multiplier, dither\n"                                                \
 	"	attribute vec4 a_color;\n"                                                                                   \
 	"	attribute vec4 a_extra; // texcoord.xy ofs, unused.xy\n"                                                     \
@@ -912,10 +913,10 @@ const char *gte_shader_32_rgba = "	uniform sampler2D s_texture;\n"
 	"		v_color = a_color;\n"                                                                                       \
 	"		v_rtxInvZ = (a_depth > 0.0) ? 1.0 / a_depth : 0.0;\n"                                                      \
 	"		v_color.xyz *= a_texcoord.z;\n"                                                                             \
-	"		v_page_clut.x = fract(a_position.z / 16.0) * 1024.0;\n"                                                     \
-	"		v_page_clut.y = floor(a_position.z / 16.0) * 256.0;\n"                                                      \
-	"		v_page_clut.z = fract(a_position.w / 64.0);\n"                                                              \
-	"		v_page_clut.w = floor(a_position.w / 64.0) / 512.0;\n"                                                      \
+	"		v_page_clut.x = fract(a_pageClut.x / 16.0) * 1024.0;\n"                                                     \
+	"		v_page_clut.y = floor(a_pageClut.x / 16.0) * 256.0;\n"                                                      \
+	"		v_page_clut.z = fract(a_pageClut.y / 64.0);\n"                                                              \
+	"		v_page_clut.w = floor(a_pageClut.y / 64.0) / 512.0;\n"                                                      \
 	"		v_page_clut.xy += c_UVFudge;\n"                                                                             \
 	"		v_page_clut.zw += c_UVFudge;\n" GTE_PERSPECTIVE_CORRECTION "		v_z = (gl_Position.z - 40.0) * 0.005;\n" \
 	"	}\n"
@@ -1041,6 +1042,7 @@ internal ShaderID NativeRenderer_Shader_Compile(const char *source, bool isPsxSh
 	glBindAttribLocation(program, a_color, "a_color");
 	glBindAttribLocation(program, a_extra, "a_extra");
 	glBindAttribLocation(program, a_depth, "a_depth");
+	glBindAttribLocation(program, a_pageClut, "a_pageClut");
 
 	glLinkProgram(program);
 	if (NativeRenderer_Shader_CheckProgramStatus(program) == 0)
@@ -1295,8 +1297,10 @@ int NativeRenderer_InitialisePSX(void)
 			glEnableVertexAttribArray(a_color);
 			glEnableVertexAttribArray(a_extra);
 			glEnableVertexAttribArray(a_depth);
+			glEnableVertexAttribArray(a_pageClut);
 
-			glVertexAttribPointer(a_position, 4, GL_SHORT, GL_FALSE, sizeof(GrVertex), &((GrVertex *)NULL)->x);
+			glVertexAttribPointer(a_position, 2, GL_FLOAT, GL_FALSE, sizeof(GrVertex), &((GrVertex *)NULL)->x);
+			glVertexAttribPointer(a_pageClut, 2, GL_SHORT, GL_FALSE, sizeof(GrVertex), &((GrVertex *)NULL)->page);
 			glVertexAttribPointer(a_texcoord, 4, GL_UNSIGNED_BYTE, GL_FALSE, sizeof(GrVertex), &((GrVertex *)NULL)->u);
 			glVertexAttribPointer(a_color, 4, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(GrVertex), &((GrVertex *)NULL)->r);
 			glVertexAttribPointer(a_extra, 4, GL_BYTE, GL_FALSE, sizeof(GrVertex), &((GrVertex *)NULL)->tcx);
