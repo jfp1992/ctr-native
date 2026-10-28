@@ -78,6 +78,18 @@ void main()
 	vec2 q = (vec2(px) + 0.5) * inSize / vec2(outW, outH); // the output pixel's centre in internal pixels
 	ivec2 c0 = ivec2(floor(q - J));                          // the internal pixel whose sample is nearest
 
+	// split screen: this output pixel's view; between the views, black (the
+	// game draws its bars there)
+	int view = viewOfPixel(ivec2(px), uvec2(outW, outH));
+	if (view < 0)
+	{
+		depthOut[idx] = 1e9;
+		taaCur[idx] = vec4(0.0, 0.0, 0.0, 1.0);
+		outPixels[idx] = 0xff000000u;
+		return;
+	}
+	useView(view);
+
 	vec4 g0 = geo[clamp(c0.y, 0, int(F.size.y) - 1) * int(F.size.x) + clamp(c0.x, 0, int(F.size.x) - 1)];
 	depthOut[idx] = (g0.w > 0.0) ? g0.w : 1e9;
 
@@ -126,32 +138,32 @@ void main()
 			zNear = (z > 0.0) ? min(zNear, z) : zNear;
 		}
 	}
-	cur = sum / max(wsum, 1e-6);
+	cur = (taps > 0.0) ? sum / max(wsum, 1e-6) : dispAt(c0);
 
 	// where this pixel was last frame: its surface (or, for the sky, its direction)
-	vec2 dispSize = vec2(F.proj2.y, F.proj2.z);
+	vec2 dispSize = vec2(V.proj2.y, V.proj2.z);
 	vec2 s = (vec2(px) + 0.5) / vec2(outW, outH) * dispSize;
-	vec2 c = s - vec2(F.proj.y, F.proj.z) - 0.5 * vec2(F.proj.w, F.proj2.x);
-	vec3 viewDir = vec3(c / F.proj.x, 1.0);
+	vec2 c = s - vec2(V.proj.y, V.proj.z) - 0.5 * vec2(V.proj.w, V.proj2.x);
+	vec3 viewDir = vec3(c / V.proj.x, 1.0);
 	vec3 pv;
 	if (zNear < 1e29)
 	{
-		vec3 v = viewDir * zNear - F.camT.xyz;
-		vec3 p = vec3(dot(F.rInv[0].xyz, v), dot(F.rInv[1].xyz, v), dot(F.rInv[2].xyz, v));
-		pv = vec3(dot(F.prevR[0].xyz, p), dot(F.prevR[1].xyz, p), dot(F.prevR[2].xyz, p)) + F.prevT.xyz;
+		vec3 v = viewDir * zNear - V.camT.xyz;
+		vec3 p = vec3(dot(V.rInv[0].xyz, v), dot(V.rInv[1].xyz, v), dot(V.rInv[2].xyz, v));
+		pv = vec3(dot(V.prevR[0].xyz, p), dot(V.prevR[1].xyz, p), dot(V.prevR[2].xyz, p)) + V.prevT.xyz;
 	}
 	else
 	{
-		vec3 d = vec3(dot(F.rInv[0].xyz, viewDir), dot(F.rInv[1].xyz, viewDir), dot(F.rInv[2].xyz, viewDir));
-		pv = vec3(dot(F.prevR[0].xyz, d), dot(F.prevR[1].xyz, d), dot(F.prevR[2].xyz, d));
+		vec3 d = vec3(dot(V.rInv[0].xyz, viewDir), dot(V.rInv[1].xyz, viewDir), dot(V.rInv[2].xyz, viewDir));
+		pv = vec3(dot(V.prevR[0].xyz, d), dot(V.prevR[1].xyz, d), dot(V.prevR[2].xyz, d));
 	}
-	bool valid = (F.counts.w == 0u) && (pv.z > 1e-3);
+	bool valid = (F.counts.w == 0u) && (V.misc.y == 0.0) && (pv.z > 1e-3);
 	vec2 pp = vec2(0.0);
 	if (valid)
 	{
-		vec2 ps = vec2(F.proj.y, F.proj.z) + 0.5 * vec2(F.proj.w, F.proj2.x) + pv.xy * (F.proj2.w / pv.z);
+		vec2 ps = vec2(V.proj.y, V.proj.z) + 0.5 * vec2(V.proj.w, V.proj2.x) + pv.xy * (V.proj2.w / pv.z);
 		pp = ps / dispSize * vec2(outW, outH);
-		valid = (pp.x >= 0.0) && (pp.y >= 0.0) && (pp.x <= float(outW)) && (pp.y <= float(outH));
+		valid = (pp.x >= 0.0) && (pp.y >= 0.0) && (pp.x <= float(outW)) && (pp.y <= float(outH)) && inView(ps);
 	}
 
 	vec4 result = cur;

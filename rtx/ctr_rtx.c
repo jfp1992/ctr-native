@@ -73,8 +73,16 @@ typedef struct
 	float camT[4];
 	float prevR[3][4];
 	float prevT[4];
-	float proj[4];
-	float proj2[4];
+	float proj[4];  // H, vpX, vpY, vpW
+	float proj2[4]; // vpH, dispW, dispH, prevH
+	float rect[4];  // display pixels it owns: x0, y0, x1, y1
+	float misc[4];  // near texture depth, history reset (its camera cut)
+} ViewData;
+
+// mirrors FrameBuf in shaders/common.glsl (std430, vec4 aligned)
+typedef struct
+{
+	ViewData views[RTX_MAX_VIEWS];
 	uint32_t size[4];
 	float sunDir[4];
 	float sunColor[4];
@@ -90,9 +98,14 @@ typedef struct
 	float gridMin[4];
 	uint32_t gridDim[4];
 	float sky[64][4];
-	uint32_t outSize[4]; // output w, h, TAA on
+	uint32_t outSize[4]; // output w, h, TAA on, views
 	float jitter[4];     // camera ray offset within its pixel (TAA)
 	uint32_t feat[4];    // texture filter, specular, fog
+	uint32_t rem[4];     // remaster: first alpha tested, grass, decal triangle; flags (1 sky cube, 2 dynamic vertices, 4 normal maps' green flipped, 8 wind)
+	uint32_t rem2[4];    // remaster: first dynamic (grass) vertex, vertices
+	float wind[4];       // seconds, wind strength now (gusts included), sky cube scale, unused
+	uint32_t rem3[4];    // remaster: first animated, proxy triangle; first animated vertex; moving parts
+	float proxy[RTX_MAX_PROXY][3][4]; // proxy slots' instance matrices this frame (rows: R | t), all zero = not there
 } FrameData;
 
 enum
@@ -874,7 +887,20 @@ static void dynSmoothNormals(const struct RtxDynTri *tris, uint32_t n, float *ou
 		{
 			float fn[3];
 			faceNormal(tris[t].p[0], tris[t].p[1], tris[t].p[2], fn);
-			float toCam = (camPos[0] - tris[t].p[0][0]) * fn[0] + (camPos[1] - tris[t].p[0][1]) * fn[1] + (camPos[2] - tris[t].p[0][2]) * fn[2];
+			// facing the nearest camera (split screen: one per player)
+			const float *cam = camPos[0];
+			float best = 1e30f;
+			for (uint32_t v = 0; v < numCams; v++)
+			{
+				float dx = camPos[v][0] - tris[t].p[0][0], dy = camPos[v][1] - tris[t].p[0][1], dz = camPos[v][2] - tris[t].p[0][2];
+				float d2 = dx * dx + dy * dy + dz * dz;
+				if (d2 < best)
+				{
+					best = d2;
+					cam = camPos[v];
+				}
+			}
+			float toCam = (cam[0] - tris[t].p[0][0]) * fn[0] + (cam[1] - tris[t].p[0][1]) * fn[1] + (cam[2] - tris[t].p[0][2]) * fn[2];
 			if (toCam < 0.0f)
 			{
 				fn[0] = -fn[0];
@@ -921,29 +947,32 @@ static void dynSmoothNormals(const struct RtxDynTri *tris, uint32_t n, float *ou
 
 // ---- glowing level surfaces -> static lights --------------------------------------------
 
-static uint16_t shmVram16(int x, int y)
+// bank: the texture page's bits 12-14 (0 the live VRAM, 1.. the hub world's)
+static uint16_t shmVram16(int bank, int x, int y)
 {
-	const uint16_t *v = (const uint16_t *)(R.shm + RTX_OFF_VRAM);
+	const uint16_t *v = (const uint16_t *)(R.shm + ((bank > 0) && (bank <= (int)RTX_VRAM_BANKS) ? RTX_OFF_HUB_VRAM + (bank - 1) * RTX_VRAM_W * RTX_VRAM_H * 2
+	                                                                                               : RTX_OFF_VRAM));
 	return v[(y & 511) * 1024 + (x & 1023)];
 }
 
 static int cpuTexel(uint16_t tpage, uint16_t clut, int u, int v, float *rgb)
 {
+	int bank = (tpage >> RTX_TPAGE_BANK_SHIFT) & 7;
 	int mode = (tpage >> 7) & 3, bx = (tpage & 15) * 64, by = ((tpage >> 4) & 1) * 256, cx = (clut & 63) * 16, cy = (clut >> 6) & 511;
 	u &= 255;
 	v &= 255;
 	uint16_t c;
 	if (mode == 0)
 	{
-		c = shmVram16(cx + ((shmVram16(bx + (u >> 2), by + v) >> ((u & 3) * 4)) & 15), cy);
+		c = shmVram16(bank, cx + ((shmVram16(bank, bx + (u >> 2), by + v) >> ((u & 3) * 4)) & 15), cy);
 	}
 	else if (mode == 1)
 	{
-		c = shmVram16(cx + ((shmVram16(bx + (u >> 1), by + v) >> ((u & 1) * 8)) & 255), cy);
+		c = shmVram16(bank, cx + ((shmVram16(bank, bx + (u >> 1), by + v) >> ((u & 1) * 8)) & 255), cy);
 	}
 	else
 	{
-		c = shmVram16(bx + u, by + v);
+		c = shmVram16(bank, bx + u, by + v);
 	}
 	if (c == 0)
 	{
@@ -1985,8 +2014,20 @@ static int fitSun(const struct RtxLevelVert *verts, const uint8_t *used, uint32_
 	{
 		numUsed += used[i];
 	}
+	// (the hub world: five hubs whose art each had its own sun; one lights them
+	// all, the one the game set, fitted to its own hub's vertices)
+	uint32_t first = R.hdr->sunFitCount ? R.hdr->sunFitFirst : 0, last = R.hdr->sunFitCount ? first + R.hdr->sunFitCount : nv;
+	last = (last < nv) ? last : nv;
+	if (R.hdr->sunFitCount)
+	{
+		numUsed = 0;
+		for (uint32_t i = first; i < last; i++)
+		{
+			numUsed += used[i];
+		}
+	}
 	uint32_t stride = numUsed > FIT_SAMPLES ? (numUsed + FIT_SAMPLES - 1) / FIT_SAMPLES : 1, ns = 0, k = 0;
-	for (uint32_t i = 0; (i < nv) && (ns < FIT_SAMPLES); i++)
+	for (uint32_t i = first; (i < last) && (ns < FIT_SAMPLES); i++)
 	{
 		if (!used[i] || (k++ % stride))
 		{
@@ -2152,6 +2193,9 @@ static void fitArt(const struct RtxLevelVert *verts, const struct RtxLevelTri *t
 		lightLum[l] = luma3(&lightData[l * 12 + 4]);
 	}
 	float sunLum = L->indoor ? 0.0f : luma3(L->sunColor);
+	// (the hub world: sun and sky strength from the hub the sun was fitted to,
+	// fitSun; every lamp from its own surroundings)
+	uint32_t sunFirst = R.hdr->sunFitCount ? R.hdr->sunFitFirst : 0, sunLast = R.hdr->sunFitCount ? sunFirst + R.hdr->sunFitCount : nv;
 	double err0 = 0.0, err1 = 0.0;
 	uint32_t nfit = 0;
 	for (int iter = 0; iter <= 40; iter++)
@@ -2182,10 +2226,13 @@ static void fitArt(const struct RtxLevelVert *verts, const struct RtxLevelTri *t
 				pred += scale[2 + j - 1] * b[BAKE_LIGHTS + 1 + k * 2] * lightLum[j - 1];
 			}
 			err += fabs(log((pred + 0.02) / (t + 0.02)));
-			num[0] += b[0] * sunLum * t;
-			den[0] += b[0] * sunLum * pred;
-			num[1] += luma3(&b[1]) * t;
-			den[1] += luma3(&b[1]) * pred;
+			if ((v >= sunFirst) && (v < sunLast))
+			{
+				num[0] += b[0] * sunLum * t;
+				den[0] += b[0] * sunLum * pred;
+				num[1] += luma3(&b[1]) * t;
+				den[1] += luma3(&b[1]) * pred;
+			}
 			for (uint32_t k = 0; k < BAKE_K; k++)
 			{
 				uint32_t j;
@@ -2395,10 +2442,13 @@ static void levelPrep(void)
 
 	// textures, for alpha-keyed shadow rays
 	memcpy(R.texSlotsStage.map, R.shm + RTX_OFF_TEX_SLOTS, R.hdr->numTexSlots * sizeof(struct RtxTexSlot));
+	// (and the hub world's own VRAM banks, which stay as they are)
+	uint32_t banks = (R.hdr->vramBanks <= RTX_VRAM_BANKS) ? R.hdr->vramBanks : RTX_VRAM_BANKS;
 	memcpy(R.vramStage.map, R.shm + RTX_OFF_VRAM, RTX_VRAM_W * RTX_VRAM_H * 2);
+	memcpy((uint8_t *)R.vramStage.map + RTX_VRAM_W * RTX_VRAM_H * 2, R.shm + RTX_OFF_HUB_VRAM, (size_t)banks * RTX_VRAM_W * RTX_VRAM_H * 2);
 	cmdBegin();
 	copyBuf(&R.texSlotsStage, &R.texSlots, R.hdr->numTexSlots * sizeof(struct RtxTexSlot));
-	copyBuf(&R.vramStage, &R.vram, RTX_VRAM_W * RTX_VRAM_H * 2);
+	copyBuf(&R.vramStage, &R.vram, (1 + banks) * RTX_VRAM_W * RTX_VRAM_H * 2);
 	cmdSubmitWait();
 
 	// what the lighting covers: visible textured surfaces, not water
@@ -2864,16 +2914,18 @@ static void initFrameBuffers(void)
 	R.bake = bufCreate((VkDeviceSize)RTX_MAX_LEVEL_VERTS * (8 + 2 * 48) * 4, USAGE_STORAGE, HOST_MEM | VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
 	R.levelTint = bufCreate(RTX_MAX_LEVEL_VERTS * 16, USAGE_STORAGE, DEVICE_LOCAL);
 	R.levelTintStage = bufCreate(RTX_MAX_LEVEL_VERTS * 16, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, HOST_MEM);
-	R.vram = bufCreate(RTX_VRAM_W * RTX_VRAM_H * 2, USAGE_STORAGE, DEVICE_LOCAL);
-	R.vramStage = bufCreate(RTX_VRAM_W * RTX_VRAM_H * 2, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, HOST_MEM);
-	R.tlasInstances = bufCreate(4 * sizeof(VkAccelerationStructureInstanceKHR), USAGE_AS_INPUT, HOST_MEM);
+	// the live VRAM, then the adventure hub world's banks (RTX_OFF_HUB_VRAM)
+	R.vram = bufCreate((1 + RTX_VRAM_BANKS) * RTX_VRAM_W * RTX_VRAM_H * 2, USAGE_STORAGE, DEVICE_LOCAL);
+	R.vramStage = bufCreate((1 + RTX_VRAM_BANKS) * RTX_VRAM_W * RTX_VRAM_H * 2, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, HOST_MEM);
+	R.tlasInstances = bufCreate(TLAS_MAX_INST * sizeof(VkAccelerationStructureInstanceKHR), USAGE_AS_INPUT, HOST_MEM);
 	R.capTris = bufCreate(RTX_MAX_LEVEL_CAP * sizeof(struct RtxDynTri), USAGE_STORAGE, DEVICE_LOCAL);
 	R.capTrisStage = bufCreate(RTX_MAX_LEVEL_CAP * sizeof(struct RtxDynTri), VK_BUFFER_USAGE_TRANSFER_SRC_BIT, HOST_MEM);
 	R.capPos = bufCreate(RTX_MAX_LEVEL_CAP * 36, USAGE_STORAGE | USAGE_AS_INPUT, DEVICE_LOCAL);
 	R.capPosStage = bufCreate(RTX_MAX_LEVEL_CAP * 36, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, HOST_MEM);
-	R.lum = bufCreate(512, USAGE_STORAGE, HOST_MEM); // exposure sums, texture diagnostics
+	R.lum = bufCreate(8192, USAGE_STORAGE, HOST_MEM); // exposure sums, texture diagnostics, sky leaks (100..138), Ctrl+F6 probe (256+)
 
-	// TLAS sized for 4 instances (level, models, texture layer, the level forced opaque), built every frame
+	// TLAS sized for TLAS_MAX_INST instances (level, models, texture layer, the level forced opaque; or the
+	// remaster mesh's two in the level's place), built every frame
 	VkAccelerationStructureGeometryKHR g = {VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR, .geometryType = VK_GEOMETRY_TYPE_INSTANCES_KHR};
 	g.geometry.instances.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR;
 	g.geometry.instances.data.deviceAddress = R.tlasInstances.addr;
@@ -2951,46 +3003,56 @@ static void renderFrame(void)
 	// ---- frame constants
 	FrameData *F = R.frame.map;
 	memset(F, 0, sizeof(*F));
-	float rInv[9];
-	invert3(H->camR, rInv);
-	float camPos[3];
-	for (int r = 0; r < 3; r++)
-	{
-		camPos[r] = -(rInv[r * 3] * H->camT[0] + rInv[r * 3 + 1] * H->camT[1] + rInv[r * 3 + 2] * H->camT[2]);
-		for (int c = 0; c < 3; c++)
-		{
-			F->rInv[r][c] = rInv[r * 3 + c];
-			F->camR[r][c] = H->camR[r * 3 + c];
-		}
-		F->camPos[r] = camPos[r];
-		F->camT[r] = H->camT[r];
-	}
-	int reset = !R.havePrev || (H->frame != R.lastGameFrame + 1) || H->resetHistory || (H->lightMode != R.lastLightMode);
+	// the players' cameras (split screen: each owns its rectangle of the image)
+	uint32_t numViews = H->numViews;
+	numViews = (numViews < 1u) ? 1u : ((numViews > RTX_MAX_VIEWS) ? RTX_MAX_VIEWS : numViews);
+	int reset = !R.havePrev || (H->frame != R.lastGameFrame + 1) || H->resetHistory || (H->lightMode != R.lastLightMode) ||
+	            (numViews != R.prevNumViews);
 	R.lastLightMode = H->lightMode;
-	if (R.havePrev)
+	float camPos[RTX_MAX_VIEWS][3];
+	for (uint32_t v = 0; v < numViews; v++)
 	{
-		float dx = camPos[0] - R.prevCamPos[0], dy = camPos[1] - R.prevCamPos[1], dz = camPos[2] - R.prevCamPos[2];
-		if (dx * dx + dy * dy + dz * dz > 3000.0f * 3000.0f)
+		const struct RtxView *hv = &H->views[v];
+		ViewData *fv = &F->views[v];
+		float rInv[9];
+		invert3(hv->camR, rInv);
+		for (int r = 0; r < 3; r++)
 		{
-			reset = 1; // camera cut
+			camPos[v][r] = -(rInv[r * 3] * hv->camT[0] + rInv[r * 3 + 1] * hv->camT[1] + rInv[r * 3 + 2] * hv->camT[2]);
+			for (int c = 0; c < 3; c++)
+			{
+				fv->rInv[r][c] = rInv[r * 3 + c];
+				fv->camR[r][c] = hv->camR[r * 3 + c];
+				fv->prevR[r][c] = R.havePrev ? R.prevR[v][r * 3 + c] : hv->camR[r * 3 + c];
+			}
+			fv->camPos[r] = camPos[v][r];
+			fv->camT[r] = hv->camT[r];
+			fv->prevT[r] = R.havePrev ? R.prevT[v][r] : hv->camT[r];
 		}
+		if (R.havePrev)
+		{
+			float dx = camPos[v][0] - R.prevCamPos[v][0], dy = camPos[v][1] - R.prevCamPos[v][1], dz = camPos[v][2] - R.prevCamPos[v][2];
+			fv->misc[1] = (dx * dx + dy * dy + dz * dz > 3000.0f * 3000.0f) ? 1.0f : 0.0f; // camera cut: this view starts over
+		}
+		fv->proj[0] = hv->projH;
+		fv->proj[1] = hv->vpX;
+		fv->proj[2] = hv->vpY;
+		fv->proj[3] = hv->vpW;
+		fv->proj2[0] = hv->vpH;
+		fv->proj2[1] = H->dispW;
+		fv->proj2[2] = H->dispH;
+		fv->proj2[3] = R.havePrev ? R.prevH[v] : hv->projH;
+		fv->rect[0] = hv->vpX;
+		fv->rect[1] = hv->vpY;
+		fv->rect[2] = hv->vpX + hv->vpW;
+		fv->rect[3] = hv->vpY + hv->vpH;
+		fv->misc[0] = hv->texNearDepth;
 	}
-	for (int r = 0; r < 3; r++)
+	if (numViews == 1u)
 	{
-		for (int c = 0; c < 3; c++)
-		{
-			F->prevR[r][c] = R.havePrev ? R.prevR[r * 3 + c] : H->camR[r * 3 + c];
-		}
-		F->prevT[r] = R.havePrev ? R.prevT[r] : H->camT[r];
+		reset = reset || (F->views[0].misc[1] != 0.0f); // (as before split screen: one flag)
 	}
-	F->proj[0] = H->projH;
-	F->proj[1] = H->vpX;
-	F->proj[2] = H->vpY;
-	F->proj[3] = H->vpW;
-	F->proj2[0] = H->vpH;
-	F->proj2[1] = H->dispW;
-	F->proj2[2] = H->dispH;
-	F->proj2[3] = R.havePrev ? R.prevH : H->projH;
+	F->outSize[3] = numViews;
 	F->size[0] = R.inW;
 	F->size[1] = R.inH;
 	F->outSize[0] = R.outW;
@@ -3343,10 +3405,14 @@ static void renderFrame(void)
 		}
 	}
 
-	memcpy(R.prevR, H->camR, sizeof(R.prevR));
-	memcpy(R.prevT, H->camT, sizeof(R.prevT));
-	memcpy(R.prevCamPos, camPos, sizeof(camPos));
-	R.prevH = H->projH;
+	for (uint32_t v = 0; v < numViews; v++)
+	{
+		memcpy(R.prevR[v], H->views[v].camR, sizeof(R.prevR[v]));
+		memcpy(R.prevT[v], H->views[v].camT, sizeof(R.prevT[v]));
+		memcpy(R.prevCamPos[v], camPos[v], sizeof(camPos[v]));
+		R.prevH[v] = H->views[v].projH;
+	}
+	R.prevNumViews = numViews;
 	R.havePrev = 1;
 	R.lastGameFrame = H->frame;
 	R.parity ^= 1;

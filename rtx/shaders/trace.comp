@@ -75,6 +75,84 @@ vec3 shadeSecondary(vec3 o, vec3 d, float tmax, bool fast, inout uint rng)
 	return result;
 }
 
+// this frame's emitters (flames, turbos, torches: GL draws them, rays can't
+// meet them) seen along a ray up to tmax: a soft glow where it passes close
+// to one, in its colour at about the brightness it's drawn (unexposed radiance)
+vec3 emitterGlow(vec3 o, vec3 d, float tmax)
+{
+	vec3 sum = vec3(0.0);
+	for (uint i = 0u; i < F.extra.x; i++)
+	{
+		uint j = F.counts.x + i;
+		vec4 l0 = lights[j * 3u], l1 = lights[j * 3u + 1u], l2 = lights[j * 3u + 2u];
+		float s = dot(l0.xyz - o, d);
+		vec3 q = o + d * s - l0.xyz;
+		float r = 2.0 * l2.x;
+		float x = dot(q, q) / (r * r);
+		if ((s <= 0.0) || (s > tmax) || (x >= 1.0))
+		{
+			continue;
+		}
+		float mc = max(l1.r, max(l1.g, l1.b));
+		sum += l1.rgb / max(mc, 1e-3) * min(mc, 1.5) * (1.0 - x) * (1.0 - x);
+	}
+	return sum / max(F.sunColor.w, 1e-3);
+}
+
+// a see-through layer's reflection (unexposed radiance) at pos, seen along
+// dir: one ray where it meets the sky (that's exact), more where it meets the
+// level (in a tunnel the walls' light is the noisy part), averaged over a
+// few frames at the layer's own surface (the pixel's history is the surface
+// under it); fewer the more the view of the point turns since (a reflection
+// moves with the eye) or the water moves it; the emitters' glow on top (they
+// move with the karts: kept out of the history). Writes the pixel's layer history
+vec3 layerReflection(vec3 o, vec3 r, vec3 pos, vec3 dir, uint idx, inout uint rng)
+{
+	vec4 h = vec4(0.0);
+	float maxCount = 1.0;
+	if ((F.counts.w == 0u) && (V.misc.y == 0.0))
+	{
+		vec3 pv = vec3(dot(V.prevR[0].xyz, pos), dot(V.prevR[1].xyz, pos), dot(V.prevR[2].xyz, pos)) + V.prevT.xyz;
+		if (pv.z > 1.0)
+		{
+			vec2 disp = vec2(V.proj2.y, V.proj2.z);
+			vec2 ps = vec2(V.proj.y, V.proj.z) + 0.5 * vec2(V.proj.w, V.proj2.x) + pv.xy * (V.proj2.w / pv.z);
+			ivec2 ip = ivec2(floor(ps / disp * vec2(F.size.xy)));
+			if ((ip.x >= 0) && (ip.y >= 0) && (ip.x < int(F.size.x)) && (ip.y < int(F.size.y)) && inView(ps))
+			{
+				vec4 hp = layerPrev[ip.y * int(F.size.x) + ip.x];
+				float hz = floor(hp.a / 16.0), hc = hp.a - 16.0 * hz;
+				if ((hc > 0.0) && (abs(hz - pv.z) < 0.03 * pv.z + 1.0))
+				{
+					// (the direction it was seen from last frame: prevR^T x its view position)
+					vec3 was = V.prevR[0].xyz * pv.x + V.prevR[1].xyz * pv.y + V.prevR[2].xyz * pv.z;
+					float turn = 1.0 - dot(normalize(was), dir);
+					maxCount = (turn < 2e-5) ? 8.0 : ((turn < 2e-4) ? 4.0 : 2.0);
+					h = vec4(hp.rgb, hc);
+				}
+			}
+		}
+	}
+	vec3 sum = shadeSecondary(o, r, 1e8, false, rng);
+	vec3 glow = emitterGlow(o, r, g_secT);
+	uint n = 1u;
+	if (!g_secMiss)
+	{
+		uint base = max(F.extra.w, 2u);
+		n = base + ((h.a < 4.0) ? base / 2u : 0u);
+		for (uint i = 1u; i < n; i++)
+		{
+			sum += shadeSecondary(o, r, 1e8, false, rng);
+		}
+	}
+	vec3 refl = sum / float(n);
+	float count = min(h.a + 1.0, maxCount);
+	refl = mix(h.rgb, refl, 1.0 / count);
+	float viewZ = max(dot(V.camR[2].xyz, pos) + V.camT.z, 0.0);
+	layerCur[idx] = vec4(refl, count + 16.0 * floor(viewZ + 0.5));
+	return refl + glow;
+}
+
 // traceCaptured, and on a miss the same a PS1 pixel and a half to each side in the
 // surface plane: the PS1's polygons leave cracks (T-junctions where neighbours are
 // subdivided differently) that would show the level mesh's own texture as a line
@@ -130,6 +208,29 @@ void main()
 		return;
 	}
 	uint idx = px.y * outW + px.x;
+	// split screen: the camera of the view owning this pixel; the bars between
+	// the views aren't traced (final.comp leaves them black; nothing reads them:
+	// history and filters stay within each view)
+	int view = viewOfPixel(ivec2(px), uvec2(outW, outH));
+	if (view < 0)
+	{
+		layerOut[idx] = vec4(0.0);
+		layerCur[idx] = vec4(0.0);
+		albedoOut[idx] = vec4(0.0);
+		geoCur[idx] = vec4(0.0, 0.0, 0.0, -1.0);
+		histCur[idx] = vec4(0.0);
+		histDynCur[idx] = vec4(0.0);
+		combined[idx] = vec4(0.0);
+		momCur[idx] = vec4(0.0);
+		resCur[idx] = vec4(0.0);
+		specCur[idx] = vec4(0.0);
+		fogCur[idx] = vec4(0.0, 0.0, 0.0, 1.0);
+		return;
+	}
+	useView(view);
+	g_probe = probeRecord(px, outW, outH);
+	probeWord(0u, px.x | (px.y << 16));
+	probeWord(9u, 0xffffffffu);
 	uint rng = (px.x * 1973u + px.y * 9277u + F.size.z * 26699u) | 1u;
 	pcg(rng);
 
@@ -277,35 +378,76 @@ void main()
 			}
 		}
 	}
+	probeWord(5u, floatBitsToUint(probeLuma(sf.albedo)));
+	g_decalCount = 0u;
+	if ((F.extra.y != 0u) && !sf.dynamic)
+	{
+		// remaster decals over the camera hit (on the level as it is seen)
+		vec3 o = (layer.a > 0.0) ? rayO : origin;
+		remDecals(o, dir, dot(sf.pos - o, dir), sf);
+	}
+	probeWord(6u, floatBitsToUint(probeLuma(sf.albedo)));
+	probeWord(7u, g_decalCount);
 	vec3 p = sf.pos, n = sf.normal, ng = sf.geoNormal;
 	float eps = surfaceEps(p, sf.dynamic);
 	vec3 pl = sf.shadowPos + ng * (eps - rayEps(p)); // off the curved surface; models a bit further out
-	// several light/bounce samples per pixel per frame: the quality preset's
-	// (ctr_rtx.c, fewer when the trace would overrun its time budget); half as
-	// many again where the noise is: by how much this pixel's light varied from
-	// frame to frame against its brightness (dark spots, where few rays find
-	// light), and where there's little history (just revealed, or a model's
-	// shadow passing). One step, not several: a warp runs at its slowest pixel.
-	// Last frame's values at this pixel stand in for this one's
+	if (g_probe >= 0)
+	{
+		// what stands between this point and the sun
+		uint oi, op;
+		vec2 ob;
+		float ot = traceClosest(rayOrigin(pl, n, ng, F.sunDir.xyz, rayEps(p)), F.sunDir.xyz, 1e7, false, oi, op, ob);
+		probeWord(9u, (dot(ng, F.sunDir.xyz) <= 0.0) ? 0xfffffffeu : (ot >= 0.0) ? oi : 0xffffffffu); // (0xfffffffe: faces away)
+		probeWord(10u, op);
+		probeWord(11u, floatBitsToUint(ot));
+	}
+	// several light/bounce samples per pixel per frame: the settings' spp
+	// (ctr_rtx.c, fewer when the trace would overrun its time budget), spent
+	// where the noise is: by how much this pixel's light varied from frame to
+	// frame against its brightness (dark spots, where few rays find light) and
+	// how much history it has (just revealed, or a model's shadow passing).
+	// Half as many again where it's noisy or young, twice as many where it's
+	// very noisy; half where it has settled (long history, steady light: the
+	// history carries it). Dark spots on screen (caves, under overhangs: few
+	// rays find light there, the noise shows most) get twice as many, the
+	// darkest three times, and never fewer. A warp runs at its slowest pixel:
+	// whole settled areas save. Last frame's values at this pixel stand in for
+	// this one's. (Noise and brightness as displayed, after exposure: dark
+	// levels are exposed up, their light values are small)
 	vec4 hp = histPrev[idx];
 	vec4 mp = momPrev[idx];
 	float hpCount = hp.a - 1000.0 * floor(hp.a / 1000.0);
-	float relNoise = sqrt(max(mp.y - mp.x * mp.x, 0.0)) / (mp.x + 0.02);
+	float shown = mp.x * exposure;
+	float relNoise = sqrt(max(mp.y - mp.x * mp.x, 0.0)) * exposure / (shown + 0.02);
+	bool dark = (hpCount >= 1.0) && (shown < 0.15);
 	uint baseSpp = max(F.extra.w, 1u);
-	uint spp = baseSpp + (((relNoise > 0.4) || (hpCount < 4.0)) ? max(baseSpp / 2u, 1u) : 0u);
+	uint spp = baseSpp;
+	if ((hpCount < 4.0) || (relNoise > 0.4))
+	{
+		spp = ((relNoise > 0.8) && (hpCount >= 4.0)) ? 2u * baseSpp : baseSpp + max(baseSpp / 2u, 1u);
+	}
+	else if ((hpCount >= 32.0) && (relNoise < 0.12) && (hp.a < 1000.0) && !dark)
+	{
+		spp = max(baseSpp / 2u, 1u);
+	}
+	if (dark)
+	{
+		spp = max(spp, ((shown < 0.05) ? 3u : 2u) * baseSpp);
+	}
+	spp = min(spp, max(baseSpp, 128u)); // (64 spp set: dark pixels at 2x, not a 192-sample dispatch)
 
 	// where this surface was last frame (its history, its light pick): same
 	// depth, facing, and kind of surface (floor behind a moving kart would
 	// otherwise take over the kart's light, a bright kart-shaped ghost)
 	int prevPix = -1;
-	if (F.counts.w == 0u)
+	if ((F.counts.w == 0u) && (V.misc.y == 0.0))
 	{
-		vec3 pv = vec3(dot(F.prevR[0].xyz, p), dot(F.prevR[1].xyz, p), dot(F.prevR[2].xyz, p)) + F.prevT.xyz;
+		vec3 pv = vec3(dot(V.prevR[0].xyz, p), dot(V.prevR[1].xyz, p), dot(V.prevR[2].xyz, p)) + V.prevT.xyz;
 		if (pv.z > 1.0)
 		{
-			vec2 ps = vec2(F.proj.y, F.proj.z) + 0.5 * vec2(F.proj.w, F.proj2.x) + pv.xy * (F.proj2.w / pv.z);
+			vec2 ps = vec2(V.proj.y, V.proj.z) + 0.5 * vec2(V.proj.w, V.proj2.x) + pv.xy * (V.proj2.w / pv.z);
 			ivec2 ip = ivec2(floor(ps / disp * vec2(outW, outH)));
-			if ((ip.x >= 0) && (ip.y >= 0) && (ip.x < int(outW)) && (ip.y < int(outH)))
+			if ((ip.x >= 0) && (ip.y >= 0) && (ip.x < int(outW)) && (ip.y < int(outH)) && inView(ps))
 			{
 				int pidx = ip.y * int(outW) + ip.x;
 				vec4 g = geoPrev[pidx];

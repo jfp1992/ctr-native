@@ -2,10 +2,13 @@
 // See include/platform/native_rtx.h and rtx/rtx_shared.h.
 
 #include "platform/native_rtx.h"
+#include "platform/native_disc_image.h"
+#include "platform/native_settings.h"
 #include "../rtx/rtx_shared.h"
 
 #include <SDL3/SDL.h>
 
+#include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <math.h>
@@ -102,9 +105,13 @@ static struct
 
 	// per frame
 	u32 gen;
-	int cameraValid;
-	float rInv[9];
-	float camT[3];
+	int cameraValid; // bit per view (split screen: one per player)
+	int numViews;    // players' views this frame
+	// cameras by view (pushBuffer index): view -> world of what each player's
+	// view drew; view = the one being recorded (drawing) or decoded (OT walk)
+	float rInv[RTX_MAX_VIEWS][9];
+	float camT[RTX_MAX_VIEWS][3];
+	int view;
 	struct RtxRange ranges[RTX_MAX_RANGES];
 	int numRanges;
 	int rangesSorted;
@@ -116,10 +123,11 @@ static struct
 	int allowSemi;
 	int instMode;
 	int lightMode;
-	int camForCapture;
+	int camForCapture; // bit per view: its camera is in camT / rInv
 	int skyPhase;
 	int numDyn;
 	struct RtxEmitter emitters[RTX_MAX_EMITTERS];
+	u8 emitterView[RTX_MAX_EMITTERS];
 	int numEmitters;
 	// glows that stay put (torches, braziers, statue fire) are remembered where
 	// they were seen: the game only draws them while they are on screen, but
@@ -159,6 +167,8 @@ static struct
 	// one per slot: ptr_texture_mid value (IconGroup4, | 1 = AnimTex), or a plain
 	// TextureLayout | 2 (the water env map)
 	u32 texSrc[RTX_MAX_TEXSRC];
+	u8 texBank[RTX_MAX_TEXSRC]; // its VRAM: 0 live, 1.. a hub of the hub world (RTX_TPAGE_BANK_SHIFT)
+	int curTexBank;             // for the slots made now
 	int numTexSlots;
 	int levelValid;
 
@@ -174,7 +184,7 @@ static struct
 	// smoke particles of this frame's OT walk as camera-facing quads (shadows, next frame)
 	struct RtxDynTri smoke[2048];
 	int numSmoke;
-	float partOfx, partOfy, partH; // the GTE projection particles are drawn with
+	float partOfx[RTX_MAX_VIEWS], partOfy[RTX_MAX_VIEWS], partH[RTX_MAX_VIEWS]; // the GTE projection particles are drawn with, by view
 
 	// karts this frame: the dynamic triangles of each driver's body, so its
 	// wheels' range can move it onto the traced floor with them (Rtx_EndTag)
@@ -446,6 +456,11 @@ void Rtx_FrameBegin(void)
 		s_rtx.gen = 1;
 	}
 	s_rtx.cameraValid = 0;
+	s_rtx.numViews = 0;
+	s_rtx.view = 0;
+	s_rtx.ctxView = 0;
+	s_rtx.dupDraw = 0;
+	memset(s_rtx.otBase, 0, sizeof(s_rtx.otBase));
 	s_rtx.numRanges = 0;
 	s_rtx.rangesSorted = 1;
 	s_rtx.tagDepth = 0;
@@ -690,11 +705,29 @@ static void Rtx_Invert3(const float *m, float *out)
 	out[8] = (a * e - b * d) * inv;
 }
 
-// camera for view -> world of everything captured this frame (models are drawn
-// before the level, whose hook sets the same camera again)
+// a player's view (pushBuffer index), -1 for any other push buffer (HUD, menus)
+static int Rtx_PbView(const struct PushBuffer *pb)
+{
+	struct GameTracker *gGT = sdata->gGT;
+	for (int v = 0; v < (int)RTX_MAX_VIEWS; v++)
+	{
+		if (pb == &gGT->pushBuffer[v])
+		{
+			return (v < gGT->numPlyrCurrGame) ? v : -1;
+		}
+	}
+	return -1;
+}
+
+// camera for view -> world of everything this view captures this frame (models
+// are drawn before the level, whose hook sets the same camera again); makes it
+// the view being recorded
 static void Rtx_CaptureCamera(struct PushBuffer *pb)
 {
-	if (s_rtx.camForCapture)
+	int v = Rtx_PbView(pb);
+	v = (v < 0) ? 0 : v;
+	s_rtx.view = v;
+	if (s_rtx.camForCapture & (1 << v))
 	{
 		return;
 	}
@@ -706,21 +739,149 @@ static void Rtx_CaptureCamera(struct PushBuffer *pb)
 		{
 			camR[r * 3 + c] = m->m[r][c] / 4096.0f;
 		}
-		s_rtx.camT[r] = (float)m->t[r];
+		s_rtx.camT[v][r] = (float)m->t[r];
 	}
-	Rtx_Invert3(camR, s_rtx.rInv);
-	s_rtx.camForCapture = 1;
+	Rtx_Invert3(camR, s_rtx.rInv[v]);
+	s_rtx.camForCapture |= 1 << v;
+}
+
+// split screen: whether key (an instance, a kart's wheels) was traced from
+// another view this frame; else this view traces it
+static int Rtx_DrawnByOtherView(const void *key)
+{
+	const int size = (int)(sizeof(s_rtx.drawnBy) / sizeof(s_rtx.drawnBy[0]));
+	u32 h = ((u32)key * 0x9E3779B1u) >> 22;
+	for (int probe = 0; probe < 64; probe++)
+	{
+		int i = (int)((h + (u32)probe) & (u32)(size - 1));
+		if (s_rtx.drawnBy[i].gen != s_rtx.gen)
+		{
+			s_rtx.drawnBy[i].gen = s_rtx.gen;
+			s_rtx.drawnBy[i].key = key;
+			s_rtx.drawnBy[i].view = s_rtx.view;
+			return 0;
+		}
+		if (s_rtx.drawnBy[i].key == key)
+		{
+			return s_rtx.drawnBy[i].view != s_rtx.view;
+		}
+	}
+	return 0;
+}
+
+// one of the live level's own object instances (its InstDefs): their memory stays valid
+static int Rtx_IsLevelInstance(const void *inst)
+{
+	const struct Level *level = sdata->gGT->level1;
+	for (u32 i = 0; (level != NULL) && (level->ptrInstDefs != NULL) && (i < level->numInstances) && (i < 512); i++)
+	{
+		if (level->ptrInstDefs[i].ptrInstance == inst)
+		{
+			return 1;
+		}
+	}
+	return 0;
+}
+
+// whether a model instance was drawn this frame (in any view)
+static int Rtx_InstDrawnThisFrame(const void *key)
+{
+	const int size = (int)(sizeof(s_rtx.drawnBy) / sizeof(s_rtx.drawnBy[0]));
+	u32 h = ((u32)key * 0x9E3779B1u) >> 22;
+	for (int probe = 0; probe < 64; probe++)
+	{
+		int i = (int)((h + (u32)probe) & (u32)(size - 1));
+		if (s_rtx.drawnBy[i].gen != s_rtx.gen)
+		{
+			return 0;
+		}
+		if (s_rtx.drawnBy[i].key == key)
+		{
+			return 1;
+		}
+	}
+	return 0;
+}
+
+// the level overlays' viewport switch (DrawLevelOvr1P_SetViewportScratchContext):
+// split screen draws every player's level in one pass, view by view
+void Rtx_SetCaptureView(struct PushBuffer *pb)
+{
+	if (RTX_HDR != NULL)
+	{
+		int v = Rtx_PbView(pb);
+		s_rtx.view = (v < 0) ? 0 : v;
+	}
 }
 
 // Model instances project through an MVP whose view space is uniformly scaled
 // (near instances x4, DRAW_HUGE /4, see RenderBucket_AdjustViewPositionForMvp);
 // the scale falls out of the MVP translation vs the instance's true view position
+// one of the level file's own models (its scenery, crates, fruit): the remaster's
+// hide list never touches karts, drivers, weapons (their models come from elsewhere)
+static int Rtx_LevelOwnsModel(const struct Model *model)
+{
+	const struct Level *level = sdata->gGT->level1;
+	if ((level == NULL) || (level->ptrModelsPtrArray == NULL))
+	{
+		return 0;
+	}
+	for (u32 i = 0; (i < level->numModels) && (i < 256); i++)
+	{
+		if (level->ptrModelsPtrArray[i] == model)
+		{
+			return 1;
+		}
+	}
+	return 0;
+}
+
+// instances of the models the renderer draws as remaster models
+// (RtxHeader.remasterProxy, hidden from the PS1 path): their world matrices,
+// whether or not the game draws them this frame (the renderer's view is wider)
+static void Rtx_PublishProxies(void)
+{
+	u32 n = 0;
+	const struct Level *level = sdata->gGT->level1;
+	if (RTX_HDR->remasterActive && (RTX_HDR->remasterProxy[0] != 0) && (level != NULL) && (level->ptrInstDefs != NULL))
+	{
+		for (u32 i = 0; (i < level->numInstances) && (n < RTX_MAX_PROXY); i++)
+		{
+			const struct Instance *inst = level->ptrInstDefs[i].ptrInstance;
+			if ((inst == NULL) || (inst->model == NULL) || (inst->flags & HIDE_MODEL))
+			{
+				continue;
+			}
+			int want = 0;
+			for (int k = 0; k < 4; k++)
+			{
+				want |= (RTX_HDR->remasterProxy[k] != 0) && (RTX_HDR->remasterProxy[k] == inst->model->id);
+			}
+			if (!want)
+			{
+				continue;
+			}
+			struct RtxProxyInst *p = &RTX_HDR->proxy[n++];
+			p->model = inst->model->id;
+			const float scale[3] = {inst->scale.x / 4096.0f, inst->scale.y / 4096.0f, inst->scale.z / 4096.0f};
+			for (int r = 0; r < 3; r++)
+			{
+				for (int c = 0; c < 3; c++)
+				{
+					p->m[r * 3 + c] = (float)inst->matrix.m[r][c] / 4096.0f * scale[c];
+				}
+				p->t[r] = (float)inst->matrix.t[r];
+			}
+		}
+	}
+	RTX_HDR->numProxy = n;
+}
+
 void Rtx_BeginInstance(struct PrimMem *primMem, struct Instance *inst, struct PushBuffer *pb, const s32 *mvpT)
 {
-	struct GameTracker *gGT = sdata->gGT;
-	if ((RTX_HDR == NULL) || (pb != &gGT->pushBuffer[0]) || (inst->flags & SCREENSPACE_INSTANCE))
+	if ((RTX_HDR == NULL) || (Rtx_PbView(pb) < 0) || (inst->flags & SCREENSPACE_INSTANCE))
 	{
-		Rtx_BeginTag(RTX_TAG_NONE, primMem); // HUD models, other players' views: GL
+		Rtx_BeginTag(RTX_TAG_NONE, primMem); // HUD models: GL
 		return;
 	}
 	// transparent models stay GL-drawn (as on PS1); glowing ones also light the scene
@@ -749,6 +910,8 @@ void Rtx_BeginInstance(struct PrimMem *primMem, struct Instance *inst, struct Pu
 	}
 	s_rtx.instScale = (dotTT > 1.0f && dotGT > 0.0f) ? dotTT / dotGT : 1.0f;
 	Rtx_CaptureCamera(pb);
+	s_rtx.dupDraw = Rtx_DrawnByOtherView(inst);
+	s_rtx.curInst = inst;
 	s_rtx.statInstances++;
 	s_rtx.curKart = ((inst->thread != NULL) && ((inst->thread->modelIndex == DYNAMIC_PLAYER) || (inst->thread->modelIndex == DYNAMIC_ROBOT_CAR))) ? inst : NULL;
 	Rtx_BeginTag(RTX_TAG_INSTANCE, primMem);
@@ -756,16 +919,18 @@ void Rtx_BeginInstance(struct PrimMem *primMem, struct Instance *inst, struct Pu
 
 void Rtx_BeginScaled(struct PrimMem *primMem, struct PushBuffer *pb, float viewScale, const struct Instance *wheelsOf)
 {
-	if ((RTX_HDR == NULL) || (pb != &sdata->gGT->pushBuffer[0]))
+	if ((RTX_HDR == NULL) || (Rtx_PbView(pb) < 0))
 	{
 		Rtx_BeginTag(RTX_TAG_NONE, primMem);
 		return;
 	}
+	Rtx_CaptureCamera(pb);
+	s_rtx.dupDraw = Rtx_DrawnByOtherView((const u8 *)wheelsOf + 1); // (its wheels: a key apart from the body's)
 	s_rtx.curWheels = wheelsOf;
+	s_rtx.curModelId = -1;
 	s_rtx.instScale = viewScale;
 	s_rtx.allowSemi = 1;
-	s_rtx.instMode = RTX_INST_CAPTURE;
-	Rtx_CaptureCamera(pb);
+	s_rtx.instMode = MT_ShotClean() ? RTX_INST_HIDE : RTX_INST_CAPTURE; // (screenshots: no kart wheels)
 	Rtx_BeginTag(RTX_TAG_INSTANCE, primMem);
 }
 
@@ -782,9 +947,14 @@ static u32 Rtx_CapHash(u32 sxy, u32 serial)
 #define RTX_CAP_PROBES 32
 #define RTX_CAP_CANDIDATES 4
 
+// projections are kept by (screen xy, serial, view): split screen views project
+// to their own viewport's coordinates
+#define RTX_CAP_KEY(serial) ((u32)(serial) | ((u32)s_rtx.view << 16))
+
 void Rtx_OnProject(u32 sxy, s32 mac1, s32 mac2, s32 mac3, int sf)
 {
-	u32 h = Rtx_CapHash(sxy, s_rtx.capSerial);
+	u32 key = RTX_CAP_KEY(s_rtx.capSerial);
+	u32 h = Rtx_CapHash(sxy, key);
 	float scale = (sf ? 1.0f : (1.0f / 4096.0f)) * s_rtx.instScale;
 	float v[3] = {mac1 * scale, mac2 * scale, mac3 * scale};
 
@@ -795,11 +965,11 @@ void Rtx_OnProject(u32 sxy, s32 mac1, s32 mac2, s32 mac3, int sf)
 		{
 			e->gen = s_rtx.gen;
 			e->sxy = sxy;
-			e->serial = s_rtx.capSerial;
+			e->serial = key;
 			memcpy(e->v, v, sizeof(v));
 			return;
 		}
-		if ((e->sxy == sxy) && (e->serial == s_rtx.capSerial) && (fabsf(e->v[0] - v[0]) + fabsf(e->v[1] - v[1]) + fabsf(e->v[2] - v[2]) < 1.0f))
+		if ((e->sxy == sxy) && (e->serial == key) && (fabsf(e->v[0] - v[0]) + fabsf(e->v[1] - v[1]) + fabsf(e->v[2] - v[2]) < 1.0f))
 		{
 			return; // the same vertex again
 		}
@@ -809,6 +979,7 @@ void Rtx_OnProject(u32 sxy, s32 mac1, s32 mac2, s32 mac3, int sf)
 // every view position projected to sxy (up to RTX_CAP_CANDIDATES), oldest first
 static int Rtx_CapLookupAll(u32 sxy, u32 serial, const float **out)
 {
+	serial = RTX_CAP_KEY(serial);
 	u32 h = Rtx_CapHash(sxy, serial);
 	int n = 0;
 
@@ -910,6 +1081,7 @@ static int Rtx_TexSlotFor(u32 ptr)
 			hashKey[i] = ptr;
 			hashVal[i] = (u16)s_rtx.numTexSlots;
 			s_rtx.texSrc[s_rtx.numTexSlots] = ptr;
+			s_rtx.texBank[s_rtx.numTexSlots] = (u8)s_rtx.curTexBank;
 			return s_rtx.numTexSlots++;
 		}
 		if (hashKey[i] == ptr)
@@ -958,7 +1130,7 @@ static void Rtx_RefreshTexSlots(void)
 		s->uv[3][0] = t->u3;
 		s->uv[3][1] = t->v3;
 		s->clut = t->clut;
-		s->tpage = t->tpage;
+		s->tpage = (u16)(t->tpage | (s_rtx.texBank[i] << RTX_TPAGE_BANK_SHIFT));
 	}
 	RTX_HDR->numTexSlots = (u32)s_rtx.numTexSlots;
 }
@@ -1346,34 +1518,133 @@ static int Rtx_IsAnimatedTexture(u16 tpage, u16 clut, const u8 (*uv)[2])
 	return 0;
 }
 
-static void Rtx_UploadLevel(struct Level *level)
-{
-	struct mesh_info *mesh = level->ptr_mesh_info;
-	struct RtxLevelVert *verts = Rtx_LevelVerts();
-	struct RtxLevelTri *tris = Rtx_LevelTris();
-	int numVerts = mesh->numVertex;
-	int numTris = 0;
+static int Rtx_HubWorldOn(void);
 
-	if (numVerts > (int)RTX_MAX_LEVEL_VERTS)
+// the renderer's key for the level being played: stock-<levelID>, custom-<first
+// bigfile entry>, nf-<slot> (Nitro-Fueled track: the stock level, remaster
+// mesh assets/rtx_remaster/nf-<slot>.rtxm), nf-<id> (a Nitro-Fueled only track
+// on a fan remake: pack_tracks.py puts the key in its author field, upper
+// case), or hubs (the adventure hub world)
+static void Rtx_LevelKey(char *key, size_t size)
+{
+	struct MTEntry *custom = MT_ActiveEntry();
+	if (Rtx_HubWorldOn())
 	{
-		numVerts = RTX_MAX_LEVEL_VERTS;
+		snprintf(key, size, "hubs");
+	}
+	else if (custom && (custom->flags & MT_FLAG_REMASTER) && !strncmp(custom->author, "NF-", 3))
+	{
+		size_t i = 0;
+		for (; (i + 1 < size) && (i < MT_AUTHOR_LEN) && custom->author[i]; i++)
+			key[i] = (char)tolower((unsigned char)custom->author[i]);
+		key[i] = 0;
+	}
+	else if (custom && (custom->flags & MT_FLAG_REMASTER))
+	{
+		snprintf(key, size, "nf-%d", custom->slot);
+	}
+	else if (custom)
+	{
+		snprintf(key, size, "custom-%d", custom->bigBase);
+	}
+	else
+	{
+		snprintf(key, size, "stock-%d", sdata->gGT->levelID);
+	}
+}
+
+// one level's mesh appended to the upload: its visible quadblocks' faces as
+// the PS1 draws them (overlay 226's tables). hub >= 0: an adventure hub of the
+// hub world (its texture bank hub + 1; triangles another hub already has, the
+// tunnels neighbours share vertex for vertex, are left out)
+struct RtxMeshBuild
+{
+	struct RtxLevelVert *verts;
+	struct RtxLevelTri *tris;
+	int numVerts, numTris;
+	int skippedInvisible, waterQuads, waterTerrain, shared;
+};
+
+static int Rtx_SharedTri(const struct LevVertex *va, const struct LevVertex *vb, const struct LevVertex *vc, int hub)
+{
+	enum
+	{
+		SIZE = 1 << 18
+	};
+	static u64 key[SIZE];
+	static u8 owner[SIZE];
+	static u32 gen[SIZE], curGen;
+	if (hub < 0)
+	{
+		curGen++; // (a new build)
+		return 0;
+	}
+	// the corners' positions, in order
+	u64 k[3];
+	const struct LevVertex *v[3] = {va, vb, vc};
+	for (int i = 0; i < 3; i++)
+	{
+		k[i] = ((u64)(u16)v[i]->pos.x << 32) | ((u64)(u16)v[i]->pos.y << 16) | (u64)(u16)v[i]->pos.z;
+	}
+	for (int i = 0; i < 2; i++)
+	{
+		for (int j = 0; j < 2 - i; j++)
+		{
+			if (k[j] > k[j + 1])
+			{
+				u64 t = k[j];
+				k[j] = k[j + 1];
+				k[j + 1] = t;
+			}
+		}
+	}
+	u64 h = (k[0] * 0x9E3779B97F4A7C15ull) ^ (k[1] * 0xC2B2AE3D27D4EB4Full) ^ (k[2] * 0x165667B19E3779F9ull);
+	h = (h ^ (h >> 29)) | 1;
+	for (u32 probe = 0; probe < 64; probe++)
+	{
+		u32 i = (u32)((h >> 20) + probe) & (SIZE - 1);
+		if (gen[i] != curGen)
+		{
+			gen[i] = curGen;
+			key[i] = h;
+			owner[i] = (u8)hub;
+			return 0;
+		}
+		if (key[i] == h)
+		{
+			return owner[i] != (u8)hub;
+		}
+	}
+	return 0;
+}
+
+static void Rtx_AppendLevelMesh(const struct Level *level, int hub, struct RtxMeshBuild *b)
+{
+	const struct mesh_info *mesh = level->ptr_mesh_info;
+	int base = b->numVerts;
+	int numVerts = mesh->numVertex;
+	if (base + numVerts > (int)RTX_MAX_LEVEL_VERTS)
+	{
+		numVerts = (int)RTX_MAX_LEVEL_VERTS - base;
 	}
 	for (int i = 0; i < numVerts; i++)
 	{
 		const struct LevVertex *v = &mesh->ptrVertexArray[i];
-		verts[i].pos[0] = v->pos.x;
-		verts[i].pos[1] = v->pos.y;
-		verts[i].pos[2] = v->pos.z;
-		verts[i].rgba = (u32)v->color_hi[0] | ((u32)v->color_hi[1] << 8) | ((u32)v->color_hi[2] << 16) | (0xffu << 24);
+		struct RtxLevelVert *o = &b->verts[base + i];
+		o->pos[0] = v->pos.x;
+		o->pos[1] = v->pos.y;
+		o->pos[2] = v->pos.z;
+		o->rgba = (u32)v->color_hi[0] | ((u32)v->color_hi[1] << 8) | ((u32)v->color_hi[2] << 16) | (0xffu << 24);
 	}
+	b->numVerts = base + numVerts;
 
 	// water: the quadblocks of BSP leaves flagged BSP_LEAF_FLAG_WATER
 	static u8 isWater[1 << 16];
 	int numQuads = mesh->numQuadBlock < (1 << 16) ? mesh->numQuadBlock : (1 << 16);
 	memset(isWater, 0, sizeof(isWater));
-	for (int b = 0; (mesh->bspRoot != NULL) && (b < mesh->numBspNodes); b++)
+	for (int bn = 0; (mesh->bspRoot != NULL) && (bn < mesh->numBspNodes); bn++)
 	{
-		const struct BSP *bsp = &mesh->bspRoot[b];
+		const struct BSP *bsp = &mesh->bspRoot[bn];
 		if (((bsp->flag & 1) != 0) && ((bsp->flag & BSP_LEAF_FLAG_WATER) != 0))
 		{
 			int first = (int)(bsp->data.leaf.ptrQuadBlockArray - mesh->ptrQuadBlockArray);
@@ -1387,20 +1658,22 @@ static void Rtx_UploadLevel(struct Level *level)
 		}
 	}
 
-	s_rtx.numTexSlots = 0; // also resets Rtx_TexSlotFor's lookup
+	s_rtx.curTexBank = hub + 1; // (texture slots made from here on: this level's VRAM)
 	int waterSlot = (level->ptr_tex_waterEnvMap != NULL) ? Rtx_TexSlotFor((u32)level->ptr_tex_waterEnvMap | 2) : -1;
-	int skippedInvisible = 0;
 
 	for (int q = 0; q < numQuads; q++)
 	{
 		const struct QuadBlock *block = &mesh->ptrQuadBlockArray[q];
+		int terrain = block->terrain_type;
+		b->waterQuads += isWater[q];
+		b->waterTerrain += (terrain == TERRAIN_WATER) || (terrain == TERRAIN_FASTWATER);
 		// invisible walls and triggers: quadFlags 0x8000 (ctr-tools "invisible";
 		// such blocks also have no draw order), or no texture and not water (water
 		// is drawn with the level's env map instead of its own textures)
 		int untextured = !block->ptr_texture_mid[0] && !block->ptr_texture_mid[1] && !block->ptr_texture_mid[2] && !block->ptr_texture_mid[3];
 		if ((*(const u16 *)&block->quadFlags & 0x8000) || (untextured && !isWater[q]))
 		{
-			skippedInvisible++;
+			b->skippedInvisible++;
 			continue;
 		}
 		u32 drawOrderLow = block->draw_order_low;
@@ -1414,75 +1687,314 @@ static void Rtx_UploadLevel(struct Level *level)
 			int mirror = (tableWord & 0x00800000u) != 0;
 			int triangle = (tableWord & 0x80u) != 0;
 			int slotVert[4];
-			for (int s = 0; s < 4; s++)
+			for (int sl = 0; sl < 4; sl++)
 			{
-				u32 shift = (tableWord >> ((3 - s) * 8)) & 0x1f;
+				u32 shift = (tableWord >> ((3 - sl) * 8)) & 0x1f;
 				int k = (24 - (int)shift) / 8;
-				slotVert[s] = block->index[sRtxGridFace[f][k & 3]];
+				slotVert[sl] = block->index[sRtxGridFace[f][k & 3]];
 			}
 
 			int texSlot = isWater[q] && (waterSlot >= 0) ? waterSlot : Rtx_TexSlotFor((u32)block->ptr_texture_mid[f]);
 			int animated = !isWater[q] && (((u32)block->ptr_texture_mid[f] & 1) != 0);
-			int terrain = block->terrain_type;
-			int glossy = (terrain == TERRAIN_ICY_ROAD) || (terrain == TERRAIN_METAL);
+			// (river asphalt: the shallow water karts drive through, drawn as a plain
+			// texture, e.g. Sewer Speedway's: wet, so it reflects like these)
+			int glossy = (terrain == TERRAIN_ICY_ROAD) || (terrain == TERRAIN_METAL) || (terrain == TERRAIN_RIVERASPHALT);
 			int ice = (terrain == TERRAIN_ICE);
 			static const int triSlots[2][3] = {{0, 1, 2}, {1, 3, 2}};
 			static const u8 mirrorCorner[4] = {1, 0, 3, 2};
 			for (int t = 0; t < (triangle ? 1 : 2); t++)
 			{
-				if (numTris >= (int)RTX_MAX_LEVEL_TRIS)
+				if (b->numTris >= (int)RTX_MAX_LEVEL_TRIS)
 				{
 					break;
 				}
-				struct RtxLevelTri *tri = &tris[numTris];
-				int ok = 1;
+				struct RtxLevelTri *tri = &b->tris[b->numTris];
+				int ok = 1, vi[3];
 				for (int c = 0; c < 3; c++)
 				{
-					int vi = slotVert[triSlots[t][c]];
-					ok &= (vi < numVerts);
-					tri->v[c] = (u16)vi;
+					vi[c] = slotVert[triSlots[t][c]];
+					ok &= (vi[c] < numVerts);
+					tri->v[c] = (u16)(base + vi[c]);
 					tri->corner[c] = mirror ? mirrorCorner[triSlots[t][c]] : (u8)triSlots[t][c];
 				}
-				if (!ok || (tri->v[0] == tri->v[1]) || (tri->v[1] == tri->v[2]) || (tri->v[0] == tri->v[2]))
+				if (!ok || (vi[0] == vi[1]) || (vi[1] == vi[2]) || (vi[0] == vi[2]))
 				{
 					continue;
+				}
+				if ((hub >= 0) &&
+				    Rtx_SharedTri(&mesh->ptrVertexArray[vi[0]], &mesh->ptrVertexArray[vi[1]], &mesh->ptrVertexArray[vi[2]], hub))
+				{
+					b->shared++;
+					continue; // (the neighbour's copy of a tunnel both hubs hold)
 				}
 				tri->texSlot = (u16)(texSlot < 0 ? 0xffff : texSlot);
 				tri->flags = (texSlot >= 0 ? RTX_TRI_TEXTURED : 0) | ((drawOrderLow & 0x80000000u) ? RTX_TRI_DOUBLE_SIDED : 0) |
 				             (isWater[q] ? RTX_TRI_WATER : 0) | (animated ? RTX_TRI_ANIMATED : 0) | (glossy ? RTX_TRI_GLOSSY : 0) |
 				             (ice ? RTX_TRI_ICE : 0);
-				numTris++;
+				b->numTris++;
 			}
 		}
 	}
+	s_rtx.curTexBank = 0;
+}
 
-	Rtx_BuildFloorGrid(verts, numVerts, tris, numTris);
-	Rtx_FindAnimatedTextures();
+// ---- adventure hub world ------------------------------------------------------
+// The five hubs share one world frame (neighbours hold the tunnel between them
+// vertex for vertex) but the game keeps two at a time (their textures use two
+// alternating VRAM layouts) and swaps them in the tunnels. The renderer traces
+// all five at once, from copies read off the disc here with each hub's own
+// VRAM (RTX_OFF_HUB_VRAM): every hub is seen from anywhere, nothing pops in at
+// a swap, and one level preparation covers them all (key "hubs"). The game's
+// own hub swapping goes on underneath, for collision, objects and scripts.
+#define RTX_HUB_COUNT 5
+static struct
+{
+	int state; // 0 not read yet, 1 ready, -1 failed
+	struct Level *level[RTX_HUB_COUNT];
+} s_hub;
 
-	struct GameTracker *gGT = sdata->gGT;
-	struct MTEntry *custom = MT_ActiveEntry();
-	RTX_HDR->numLevelVerts = (u32)numVerts;
-	RTX_HDR->numLevelTris = (u32)numTris;
-	RTX_HDR->levelID = gGT->levelID;
-	RTX_HDR->redirectBase = custom ? custom->bigBase : -1;
-	if (custom)
+static int Rtx_IsHub(int levelID)
+{
+	return (levelID >= GEM_STONE_VALLEY) && (levelID <= CITADEL_CITY);
+}
+
+// in a hub, with the hub world read
+static int Rtx_HubWorldOn(void)
+{
+	return Rtx_IsHub(sdata->gGT->levelID) && (s_hub.state > 0);
+}
+
+static u8 *Rtx_ReadBigfileEntry(const struct NativeDiscImageFile *big, int index, u32 *size)
+{
+	const struct BigEntry *e = BIG_GETENTRY(sdata->ptrBigfile1) + index;
+	u32 sectors = ((u32)e->size + 2047) / 2048;
+	u8 *buf = malloc(sectors * 2048 + 4);
+	if ((buf == NULL) || !NativeDiscImage_ReadDataSectors(big, (u32)e->offset, sectors, buf))
 	{
-		snprintf(RTX_HDR->lightsKey, sizeof(RTX_HDR->lightsKey), "custom-%d", custom->bigBase);
+		free(buf);
+		return NULL;
+	}
+	*size = (u32)e->size;
+	return buf;
+}
+
+// a level file read off the disc made usable: the level struct starts after
+// the file's size word; the pointer map (u32 bytes, then offsets from the
+// level: the hubs' own file, or after the level in the same file) turns its
+// offsets into pointers. NULL when the map doesn't fit
+static struct Level *Rtx_PatchDiscLevel(u8 *lev, u32 levSize, const u8 *ptr, u32 ptrSize)
+{
+	if (levSize < 8)
+	{
+		return NULL;
+	}
+	u8 *origin = lev + 4;
+	u32 bodySize = levSize - 4;
+	if (ptr == NULL)
+	{
+		bodySize = *(const u32 *)lev;
+		if ((bodySize > levSize - 8) || (bodySize & 3))
+		{
+			return NULL;
+		}
+		ptr = origin + bodySize;
+		ptrSize = levSize - 4 - bodySize;
+	}
+	u32 numPtrs = (ptrSize >= 4) ? *(const u32 *)ptr / 4 : 0;
+	if ((ptrSize < 4) || (4 + numPtrs * 4 > ptrSize))
+	{
+		return NULL;
+	}
+	for (u32 i = 0; i < numPtrs; i++)
+	{
+		u32 off = ((const u32 *)(ptr + 4))[i] & ~3u;
+		if (off + 4 <= bodySize)
+		{
+			*(u32 *)(origin + off) += (u32)origin;
+		}
+	}
+	return (struct Level *)origin;
+}
+
+// a level's texture file (.vrm: one TIM, or packed TIMs) written over a VRAM bank
+static void Rtx_VrmToBank(u16 *bank, const u8 *vrm, u32 vrmSize)
+{
+	const u8 *vrmEnd = vrm + vrmSize;
+	int packed = (vrmSize >= 8) && (*(const u32 *)vrm == 0x20);
+	u32 recSize = packed ? *(const u32 *)(vrm + 4) : vrmSize;
+	const u8 *rec = packed ? vrm + 8 : vrm;
+	while ((recSize != 0) && (rec + sizeof(struct VramHeader) <= vrmEnd))
+	{
+		const struct VramHeader *vh = (const struct VramHeader *)rec;
+		const u16 *pix = (const u16 *)VRAMHEADER_GETPIXLES(vh);
+		for (int y = 0; y < vh->rect.h; y++)
+		{
+			int vy = vh->rect.y + y;
+			if ((vy < 0) || (vy >= (int)RTX_VRAM_H) || ((const u8 *)(pix + (y + 1) * vh->rect.w) > vrmEnd))
+			{
+				break;
+			}
+			for (int x = 0; (x < vh->rect.w) && (vh->rect.x + x < (int)RTX_VRAM_W); x++)
+			{
+				bank[vy * RTX_VRAM_W + vh->rect.x + x] = pix[y * vh->rect.w + x];
+			}
+		}
+		if (!packed)
+		{
+			break;
+		}
+		rec += recSize;
+		recSize = (rec + 4 <= vrmEnd) ? *(const u32 *)rec : 0;
+		rec += 4;
+	}
+}
+
+// the hub world's copies dropped (their VRAM banks get reused: Rtx_UploadBakeLevel);
+// read again on the next hub
+static void Rtx_HubWorldForget(void)
+{
+	for (int h = 0; h < RTX_HUB_COUNT; h++)
+	{
+		if (s_hub.level[h] != NULL)
+		{
+			free((u8 *)s_hub.level[h] - 4);
+			s_hub.level[h] = NULL;
+		}
+	}
+	s_hub.state = 0;
+	if (s_rtx.levelValid && Rtx_IsHub(s_rtx.levelID))
+	{
+		s_rtx.levelValid = 0;
+	}
+}
+
+static int Rtx_HubWorldReady(void)
+{
+	if (s_hub.state != 0)
+	{
+		return s_hub.state > 0;
+	}
+	s_hub.state = -1;
+	const char *env = SDL_getenv("CTR_RTX_HUBWORLD"); // 0: each hub on its own, as the game loads them
+	if ((env != NULL) && (atoi(env) == 0))
+	{
+		return 0;
+	}
+	struct NativeDiscImageFile big;
+	if ((sdata->ptrBigfile1 == NULL) || !NativeDiscImage_FindFile("BIGFILE.BIG", &big))
+	{
+		printf("[RTX] hub world: no BIGFILE.BIG\n");
+		return 0;
+	}
+	u16 *banks = (u16 *)(s_rtx.base + RTX_OFF_HUB_VRAM);
+	const u16 *live = NativeRenderer_RtxVRAM();
+	for (int h = 0; h < RTX_HUB_COUNT; h++)
+	{
+		int first = BI_ADVENTUREHUB + h * LOAD_CUTSCENE_FILES_PER_LEVEL;
+		u32 levSize, ptrSize, vrmSize;
+		u8 *lev = Rtx_ReadBigfileEntry(&big, first + LVI_LEV, &levSize);
+		u8 *ptr = Rtx_ReadBigfileEntry(&big, first + LVI_PTR, &ptrSize);
+		u8 *vrm = Rtx_ReadBigfileEntry(&big, first + LVI_VRAM, &vrmSize);
+		if ((lev == NULL) || (ptr == NULL) || (vrm == NULL) || (levSize < 8) || (ptrSize < 4))
+		{
+			printf("[RTX] hub world: hub %d unreadable\n", GEM_STONE_VALLEY + h);
+			return 0;
+		}
+		s_hub.level[h] = Rtx_PatchDiscLevel(lev, levSize, ptr, ptrSize);
+		free(ptr);
+		if (s_hub.level[h] == NULL)
+		{
+			printf("[RTX] hub world: hub %d pointer map broken\n", GEM_STONE_VALLEY + h);
+			free(lev);
+			free(vrm);
+			return 0;
+		}
+		// its VRAM: what is loaded now (shared pages) with its own texture file on top
+		u16 *bank = banks + (size_t)h * RTX_VRAM_W * RTX_VRAM_H;
+		memcpy(bank, live, RTX_VRAM_W * RTX_VRAM_H * 2);
+		Rtx_VrmToBank(bank, vrm, vrmSize);
+		free(vrm);
+	}
+	s_hub.state = 1;
+	printf("[RTX] hub world: the %d adventure hubs read for tracing\n", RTX_HUB_COUNT);
+	return 1;
+}
+
+static void Rtx_UploadLevel(struct Level *level)
+{
+	struct GameTracker *gGT = sdata->gGT;
+	struct RtxMeshBuild b;
+	memset(&b, 0, sizeof(b));
+	b.verts = Rtx_LevelVerts();
+	b.tris = Rtx_LevelTris();
+	s_rtx.numTexSlots = 0; // also resets Rtx_TexSlotFor's lookup
+	int hubWorld = Rtx_IsHub(gGT->levelID) && Rtx_HubWorldReady();
+	if (hubWorld)
+	{
+		Rtx_SharedTri(NULL, NULL, NULL, -1);
+		for (int h = 0; h < RTX_HUB_COUNT; h++)
+		{
+			int first = b.numVerts;
+			Rtx_AppendLevelMesh(s_hub.level[h], h, &b);
+			if (GEM_STONE_VALLEY + h == N_SANITY_BEACH)
+			{
+				// one sun for the whole world: each hub's art was lit with its own,
+				// none fits all five; the beach's (outdoors, where adventure starts)
+				RTX_HDR->sunFitFirst = (u32)first;
+				RTX_HDR->sunFitCount = (u32)(b.numVerts - first);
+			}
+		}
 	}
 	else
 	{
-		snprintf(RTX_HDR->lightsKey, sizeof(RTX_HDR->lightsKey), "stock-%d", gGT->levelID);
+		RTX_HDR->sunFitFirst = RTX_HDR->sunFitCount = 0;
+		Rtx_AppendLevelMesh(level, -1, &b);
 	}
+
+	Rtx_BuildFloorGrid(b.verts, b.numVerts, b.tris, b.numTris);
+	Rtx_FindAnimatedTextures();
+
+	struct MTEntry *custom = MT_ActiveEntry();
+	RTX_HDR->numLevelVerts = (u32)b.numVerts;
+	RTX_HDR->numLevelTris = (u32)b.numTris;
+	RTX_HDR->levelID = gGT->levelID;
+	RTX_HDR->redirectBase = custom ? custom->bigBase : -1;
+	RTX_HDR->vramBanks = hubWorld ? RTX_VRAM_BANKS : 0;
+	Rtx_LevelKey(RTX_HDR->lightsKey, sizeof(RTX_HDR->lightsKey));
 	Rtx_RefreshTexSlots();
 	Rtx_UploadSky(level);
 	RTX_HDR->levelGen++;
 
 	s_rtx.levelPtr = level;
-	s_rtx.meshPtr = mesh;
+	s_rtx.meshPtr = level->ptr_mesh_info;
 	s_rtx.levelID = gGT->levelID;
 	s_rtx.levelValid = 1;
-	printf("[RTX] level %d (%s): %d verts, %d tris, %d texture slots, %d invisible quads skipped\n", gGT->levelID, RTX_HDR->lightsKey, numVerts,
-	       numTris, s_rtx.numTexSlots, skippedInvisible);
+	printf("[RTX] level %d (%s): %d verts, %d tris, %d texture slots, %d invisible quads skipped; water: %d quads (%d water terrain), %d vertices, "
+	       "config 0x%x%s\n",
+	       gGT->levelID, RTX_HDR->lightsKey, b.numVerts, b.numTris, s_rtx.numTexSlots, b.skippedInvisible, b.waterQuads, b.waterTerrain,
+	       level->numWaterVertices, (unsigned)level->configFlags, hubWorld ? "; hub world: all 5 hubs" : "");
+	if (hubWorld)
+	{
+		printf("[RTX] hub world: %d triangles of tunnels two hubs share left out\n", b.shared);
+	}
+}
+
+// levels the renderer traces: race / battle tracks, the Adventure hubs (boss
+// intros and the podium play there too) and the Adventure character select
+// garage (a MAIN_MENU level), the intro movie's levels; the end of race too.
+// Menus and the other story cutscenes keep the PS1 look
+static int Rtx_LevelTraced(struct GameTracker *gGT)
+{
+	if (gGT->levelID == ADVENTURE_GARAGE)
+	{
+		return (gGT->gameMode1 & (GAME_CUTSCENE | END_OF_RACE)) == 0;
+	}
+	if ((gGT->levelID >= INTRO_RACE_TODAY) && (gGT->levelID <= INTRO_OXIDE))
+	{
+		return 1; // the intro movie (Oxide's arrival)
+	}
+	// (the end of race too: the AI drives on over the traced track)
+	return (gGT->levelID <= CITADEL_CITY) && ((gGT->gameMode1 & (MAIN_MENU | GAME_CUTSCENE)) == 0);
 }
 
 void Rtx_OnLevelCamera(struct PushBuffer *pb)
@@ -1490,44 +2002,72 @@ void Rtx_OnLevelCamera(struct PushBuffer *pb)
 	struct GameTracker *gGT = sdata->gGT;
 	struct Level *level = gGT->level1;
 
-	// gameplay only: menus and cutscenes keep the PS1 look
-	if ((RTX_HDR == NULL) || (level == NULL) || (level->ptr_mesh_info == NULL) || (gGT->numPlyrCurrGame != 1) ||
-	    ((gGT->gameMode1 & (MAIN_MENU | GAME_CUTSCENE | END_OF_RACE)) != 0) || (gGT->levelID >= GEM_STONE_VALLEY) || (sdata->pause_state != 0))
+	int view = Rtx_PbView(pb);
+	if ((RTX_HDR == NULL) || (level == NULL) || (level->ptr_mesh_info == NULL) || (view < 0) || !Rtx_LevelTraced(gGT) || (sdata->pause_state != 0))
 	{
 		return;
 	}
-	if ((s_rtx.levelPtr != level) || (s_rtx.meshPtr != level->ptr_mesh_info) || (s_rtx.levelID != gGT->levelID) || !s_rtx.levelValid)
+	// (a Nitro-Fueled track and its stock level, or two custom tracks on one slot,
+	// load the same level into the same memory: the key tells them apart)
+	if (Rtx_IsHub(gGT->levelID))
+	{
+		Rtx_HubWorldReady(); // (read once, on the first hub)
+	}
+	char key[sizeof(RTX_HDR->lightsKey)];
+	Rtx_LevelKey(key, sizeof(key));
+	int sameLevel = (s_rtx.levelPtr == level) && (s_rtx.meshPtr == level->ptr_mesh_info) && (s_rtx.levelID == gGT->levelID);
+	if (s_rtx.levelValid && !sameLevel && Rtx_HubWorldOn() && !strcmp(key, (const char *)RTX_HDR->lightsKey))
+	{
+		// a hub swap inside the hub world: the traced world stays as it is; only
+		// the live level's animated textures (the texture layer's boosters) change
+		s_rtx.levelPtr = level;
+		s_rtx.meshPtr = level->ptr_mesh_info;
+		s_rtx.levelID = gGT->levelID;
+		RTX_HDR->levelID = gGT->levelID;
+		Rtx_FindAnimatedTextures();
+		printf("[RTX] hub world: now in hub %d (no re-upload)\n", gGT->levelID);
+	}
+	else if (!sameLevel || !s_rtx.levelValid || strcmp(key, (const char *)RTX_HDR->lightsKey))
 	{
 		Rtx_UploadLevel(level);
 	}
 
+	// this player's view (split screen: each player's, every frame)
+	struct RtxView *rv = &RTX_HDR->views[view];
 	const MATRIX *m = &pb->matrix_ViewProj;
 	for (int r = 0; r < 3; r++)
 	{
 		for (int c = 0; c < 3; c++)
 		{
-			RTX_HDR->camR[r * 3 + c] = m->m[r][c] / 4096.0f;
+			rv->camR[r * 3 + c] = m->m[r][c] / 4096.0f;
 		}
-		RTX_HDR->camT[r] = (float)m->t[r];
-		s_rtx.camT[r] = (float)m->t[r];
+		rv->camT[r] = (float)m->t[r];
+		s_rtx.camT[view][r] = (float)m->t[r];
 	}
-	Rtx_Invert3(RTX_HDR->camR, s_rtx.rInv);
-	RTX_HDR->projH = (float)pb->distanceToScreen_PREV;
-	RTX_HDR->vpX = pb->rect.x;
-	RTX_HDR->vpY = pb->rect.y;
-	RTX_HDR->vpW = pb->rect.w;
-	RTX_HDR->vpH = pb->rect.h;
-	s_rtx.otBase = (u32)pb->ptrOT;
+	Rtx_Invert3(rv->camR, s_rtx.rInv[view]);
+	s_rtx.camForCapture |= 1 << view;
+	rv->projH = (float)pb->distanceToScreen_PREV;
+	rv->vpX = pb->rect.x;
+	rv->vpY = pb->rect.y;
+	rv->vpW = pb->rect.w;
+	rv->vpH = pb->rect.h;
+	rv->texNearDepth = 0.0f; // (1P: Rtx_SetTextureNearDepth)
+	s_rtx.view = view;
+	s_rtx.otBase[view] = (u32)pb->ptrOT;
 	s_rtx.uiOtStart = (u32)gGT->pushBuffer_UI.ptrOT;
 	s_rtx.uiOtEnd = (u32)gGT->pushBuffer_UI.renderBucketOTRangeEnd;
-	s_rtx.cameraValid = 1;
+	s_rtx.cameraValid |= 1 << view;
+	s_rtx.numViews = gGT->numPlyrCurrGame;
+	RTX_HDR->numViews = (u32)s_rtx.numViews;
 }
 
 // ---- GPU side ----------------------------------------------------------------
 
 int Rtx_FrameActive(void)
 {
-	return (RTX_HDR != NULL) && s_rtx.enabled && RTX_HDR->rendererReady && s_rtx.cameraValid && s_rtx.levelValid;
+	// (every player's view: their cameras all came this frame)
+	return (RTX_HDR != NULL) && Rtx_Drawing() && RTX_HDR->rendererReady && (s_rtx.numViews > 0) && (s_rtx.cameraValid == (1 << s_rtx.numViews) - 1) &&
+	       s_rtx.levelValid;
 }
 
 // The level's LOD distances (texture detail, the far low-detail list) are tuned
@@ -1542,13 +2082,13 @@ void Rtx_SetTextureNearDepth(int depth)
 {
 	if (RTX_HDR != NULL)
 	{
-		RTX_HDR->texNearDepth = (float)depth;
+		RTX_HDR->views[0].texNearDepth = (float)depth;
 	}
 }
 
 int Rtx_LevelLodScale(int depth)
 {
-	if ((RTX_HDR == NULL) || !s_rtx.enabled || !RTX_HDR->rendererReady || !s_rtx.levelValid)
+	if ((RTX_HDR == NULL) || !Rtx_Drawing() || !RTX_HDR->rendererReady || !s_rtx.levelValid)
 	{
 		return depth;
 	}
@@ -1606,8 +2146,8 @@ static const struct RtxRange *Rtx_FindRange(u32 addr)
 
 static void Rtx_ViewToWorld(const float *v, float *out)
 {
-	float x = v[0] - s_rtx.camT[0], y = v[1] - s_rtx.camT[1], z = v[2] - s_rtx.camT[2];
-	const float *m = s_rtx.rInv;
+	const float *t = s_rtx.camT[s_rtx.view], *m = s_rtx.rInv[s_rtx.view];
+	float x = v[0] - t[0], y = v[1] - t[1], z = v[2] - t[2];
 	out[0] = m[0] * x + m[1] * y + m[2] * z;
 	out[1] = m[3] * x + m[4] * y + m[5] * z;
 	out[2] = m[6] * x + m[7] * y + m[8] * z;
@@ -1839,7 +2379,21 @@ static void Rtx_AddEmitter(const float *pos, const float *color, float weight, f
 	{
 		return;
 	}
+	// split screen: each view draws the same glow (the first view's counts)
+	if (sdata->gGT->numPlyrCurrGame > 1)
+	{
+		for (int i = 0; i < s_rtx.numEmitters; i++)
+		{
+			const float *q = s_rtx.emitters[i].pos;
+			float dx = q[0] - pos[0], dy = q[1] - pos[1], dz = q[2] - pos[2];
+			if ((s_rtx.emitterView[i] != s_rtx.view) && (dx * dx + dy * dy + dz * dz < 16.0f))
+			{
+				return;
+			}
+		}
+	}
 	s_rtx.statEmitAdded++;
+	s_rtx.emitterView[s_rtx.numEmitters] = (u8)s_rtx.view;
 	struct RtxEmitter *e = &s_rtx.emitters[s_rtx.numEmitters++];
 	for (int i = 0; i < 3; i++)
 	{
@@ -2256,14 +2810,25 @@ static void Rtx_BuildDynLights(void)
 void Rtx_TrackPacket(u32 *packet)
 {
 	u32 a = (u32)packet;
-	if ((s_rtx.otBase != 0) && (a >= s_rtx.otBase) && (a < s_rtx.otBase + 0x400 * 4))
+	for (int v = 0; v < s_rtx.numViews; v++)
 	{
-		s_rtx.ctxWorld = 1;
-		s_rtx.ctxBucket = (int)((a - s_rtx.otBase) >> 2);
+		u32 ot = s_rtx.otBase[v];
+		if ((ot != 0) && (a >= ot) && (a < ot + 0x400 * 4))
+		{
+			s_rtx.ctxWorld = 1;
+			s_rtx.ctxBucket = (int)((a - ot) >> 2);
+			s_rtx.ctxView = v;
+			s_rtx.view = v; // (its packets decode with its camera)
+			return;
+		}
 	}
-	else if ((s_rtx.uiOtStart != 0) && (a >= s_rtx.uiOtStart) && (a <= s_rtx.uiOtEnd))
+	// HUD: always on top. (The ordering table's top entries: the checkered flag
+	// and loading text in the one before the UI's (otSwapchainDB[0]), the UI's
+	// five; the UI push buffer's range end may not be set this frame)
+	u32 uiEnd = (s_rtx.uiOtEnd > s_rtx.uiOtStart + 5 * 4) ? s_rtx.uiOtEnd : s_rtx.uiOtStart + 5 * 4;
+	if ((s_rtx.uiOtStart != 0) && (a + 4 >= s_rtx.uiOtStart) && (a <= uiEnd))
 	{
-		s_rtx.ctxWorld = 0; // HUD: always on top
+		s_rtx.ctxWorld = 0;
 	}
 }
 
@@ -2295,7 +2860,8 @@ float Rtx_VertexDepth(u32 xy)
 static void Rtx_CaptureSmoke(u32 *packet, int lengthWords, float z)
 {
 	u32 code = (lengthWords >= 9) ? (packet[1] >> 24) : 0;
-	if (((code & 0xfc) != 0x2c) || (s_rtx.partH <= 0.0f) || (z <= 1.0f) || (s_rtx.numSmoke + 2 > (int)(sizeof(s_rtx.smoke) / sizeof(s_rtx.smoke[0]))))
+	int v = s_rtx.ctxView;
+	if ((v != 0) || ((code & 0xfc) != 0x2c) || (s_rtx.partH[v] <= 0.0f) || (z <= 1.0f) || (s_rtx.numSmoke + 2 > (int)(sizeof(s_rtx.smoke) / sizeof(s_rtx.smoke[0]))))
 	{
 		return;
 	}
@@ -2353,10 +2919,15 @@ int Rtx_ClassifyPacket(u32 *packet, int lengthWords)
 	case RTX_TAG_LEVEL:
 		// the exact PS1 texturing of what is on screen: the renderer's primary
 		// rays take texels from these (next frame), lighting from the level mesh
-		if (s_rtx.cameraValid && (lengthWords > 0))
+		if ((s_rtx.cameraValid & (1 << s_rtx.ctxView)) && (lengthWords > 0))
 		{
-			Rtx_CapturePacketTo(packet + 1, lengthWords, RTX_LEVEL_SERIAL, 1, (struct RtxDynTri *)(s_rtx.base + RTX_OFF_LEVEL_CAP), &s_rtx.numLevelCap,
-			                    (int)RTX_MAX_LEVEL_CAP);
+			struct RtxDynTri *cap = (struct RtxDynTri *)(s_rtx.base + RTX_OFF_LEVEL_CAP);
+			int first = s_rtx.numLevelCap;
+			Rtx_CapturePacketTo(packet + 1, lengthWords, RTX_LEVEL_SERIAL, 1, cap, &s_rtx.numLevelCap, (int)RTX_MAX_LEVEL_CAP);
+			for (int i = first; i < s_rtx.numLevelCap; i++)
+			{
+				cap[i].flags |= (u16)(s_rtx.ctxView << RTX_TRI_VIEW_SHIFT); // (split screen: the view it belongs to)
+			}
 		}
 		return RTX_PACKET_SKIP;
 	case RTX_TAG_SHADOW:
@@ -2400,13 +2971,14 @@ int Rtx_ClassifyPacket(u32 *packet, int lengthWords)
 // one particle's packet (words long, at prim): its view z for the depth test
 void Rtx_OnParticleDepth(struct PushBuffer *pb, u32 *prim, int words, s32 viewZ4, s32 ofx, s32 ofy, s32 h)
 {
-	if ((RTX_HDR == NULL) || !s_rtx.enabled || (pb != &sdata->gGT->pushBuffer[0]))
+	int v = Rtx_PbView(pb);
+	if ((RTX_HDR == NULL) || !Rtx_Drawing() || (v < 0))
 	{
 		return;
 	}
-	s_rtx.partOfx = ofx / 65536.0f;
-	s_rtx.partOfy = ofy / 65536.0f;
-	s_rtx.partH = (float)h;
+	s_rtx.partOfx[v] = ofx / 65536.0f;
+	s_rtx.partOfy[v] = ofy / 65536.0f;
+	s_rtx.partH[v] = (float)h;
 	u32 start = (u32)prim;
 	struct RtxRange *r = (s_rtx.numRanges > 0) ? &s_rtx.ranges[s_rtx.numRanges - 1] : NULL;
 	if ((r == NULL) || (r->tag != RTX_TAG_DEPTH) || (r->start != start))

@@ -2,10 +2,13 @@
 // rtx/rtx_shared.h (read as raw uint words; no 8/16-bit storage needed).
 
 #extension GL_EXT_ray_query : require
+#extension GL_EXT_nonuniform_qualifier : require
 
 layout(set = 0, binding = 0) uniform accelerationStructureEXT tlas;
 
-layout(set = 0, binding = 1, std430) readonly buffer FrameBuf
+// one player's camera (split screen: up to 4, each owning a rectangle of the
+// display; 1P: one, the whole image)
+struct View
 {
 	vec4 rInv[3];     // world = rInv * (view - camT)
 	vec4 camPos;      // xyz world camera position
@@ -24,22 +27,81 @@ layout(set = 0, binding = 1, std430) readonly buffer FrameBuf
 	vec4 ambient;     // rgb (indoor), w indoor flag
 	uvec4 counts;     // numStaticLights, numLevelTris, numDynTris, resetHistory
 	vec4 params;      // aoRadius, time (seconds), 1: level corner normals oriented (back-face test), unused
-	uvec4 extra;      // numDynLights (after the static lights), unused, lightMode (0 hybrid, 1 full), samples per pixel
-	vec4 params2;     // fog density at the camera's height, cache base cell size, fog height falloff, near texture depth (view z, 0 none)
+	uvec4 extra;      // numDynLights (after the static lights), remaster mesh in the level's place, lightMode (0 hybrid, 1 full), samples per pixel
+	vec4 params2;     // fog density at the camera's height, cache base cell size, fog height falloff, unused
 	uvec4 extra2;     // level corner normals base (in LevelNormals), cache entries (power of 2), cache write phase (0..3), unused
 	vec4 gridMin;     // static light grid: xyz origin, w cell size
 	uvec4 gridDim;    // cells per axis, w: sky table valid
 	vec4 sky[64];     // sky radiance by direction: 8 elevations (top first) x 8 azimuths
-	uvec4 outSize;    // output (TAA) w, h, TAA on, unused; size above is the traced (internal) size
+	uvec4 outSize;    // output (TAA) w, h, TAA on, views; size above is the traced (internal) size
 	vec4 jitter;      // this frame's camera ray offset within its pixel (0..1, TAA on), unused
-	uvec4 feat;       // texture filter, specular, fog, unused (RtxSettings)
+	uvec4 feat;       // texture filter, specular, fog (RtxSettings), unused
+	uvec4 rem;        // remaster: first alpha tested, grass, decal triangle; flags (1 sky cube, 2 dynamic vertices, 4 normal map green flipped, 8 wind)
+	uvec4 rem2;       // remaster: first dynamic (grass) vertex, vertices
+	vec4 wind;        // seconds, wind strength now, sky cube scale, models' brightness gain (0: none)
+	uvec4 rem3;       // remaster: first animated, proxy triangle; first animated vertex; moving parts
+	vec4 proxyM[24];  // proxy slots' instance matrices (3 rows each: R | t), zero = not there
 } F;
+
+// the view a pixel belongs to (split screen) and its camera: set by each
+// pixel's shader before any camera use (useView)
+View V;
+int g_view = 0;
+
+void useView(int v)
+{
+	g_view = v;
+	V = F.views[v];
+}
+
+// view owning PS1 display position s; -1 between the views (the split bars,
+// 3P's empty quarter). One view: always it
+int viewAt(vec2 s)
+{
+	if (F.outSize.w <= 1u)
+	{
+		return 0;
+	}
+	for (uint i = 0u; i < F.outSize.w; i++)
+	{
+		vec4 r = F.views[i].rect;
+		if ((s.x >= r.x) && (s.y >= r.y) && (s.x < r.z) && (s.y < r.w))
+		{
+			return int(i);
+		}
+	}
+	return -1;
+}
+
+// view of pixel p of an image of size (centre)
+int viewOfPixel(ivec2 p, uvec2 size)
+{
+	return (F.outSize.w <= 1u) ? 0 : viewAt((vec2(p) + 0.5) / vec2(size) * F.views[0].proj2.yz);
+}
+
+// display position s in V's own rectangle (reprojected history must stay in it)
+bool inView(vec2 s)
+{
+	return (F.outSize.w <= 1u) || ((s.x >= V.rect.x) && (s.y >= V.rect.y) && (s.x < V.rect.z) && (s.y < V.rect.w));
+}
+
+// distance to the nearest player's camera (what is shared between the views
+// sizes itself by it, so every view finds the same entries)
+float nearestCamDist(vec3 p)
+{
+	float d = length(p - F.views[0].camPos.xyz);
+	for (uint i = 1u; i < F.outSize.w; i++)
+	{
+		d = min(d, length(p - F.views[i].camPos.xyz));
+	}
+	return d;
+}
 
 layout(set = 0, binding = 2, std430) readonly buffer LevelVerts { uint levelVerts[]; };   // 4 words per vertex
 layout(set = 0, binding = 3, std430) readonly buffer LevelTris { uint levelTris[]; };     // 3 words per triangle
 layout(set = 0, binding = 4, std430) readonly buffer TexSlots { uint texSlots[]; };       // 3 words per slot
 layout(set = 0, binding = 5, std430) readonly buffer DynTris { uint dynTris[]; };         // 16 words per triangle
-layout(set = 0, binding = 6, std430) readonly buffer Vram { uint vram[]; };               // 1024x512 u16
+layout(set = 0, binding = 6, std430) readonly buffer Vram { uint vram[]; };               // 1024x512 u16: the live VRAM, then the hub world's banks
 layout(set = 0, binding = 7, std430) buffer Lights { vec4 lights[]; };                    // 3 vec4 per light
 layout(set = 0, binding = 17, std430) readonly buffer LevelNormals { vec4 levelNormals[]; }; // smooth: per vertex, then per triangle corner from F.extra2.x
 layout(set = 0, binding = 18, std430) readonly buffer DynNormals { vec4 dynNormals[]; };     // smooth, 3 per triangle
@@ -72,13 +134,18 @@ const uint TRI_GLOSSY = 32u;
 const uint TRI_ICE = 64u;
 const uint TRI_SEMI = 128u;
 const uint TRI_SMOKE = 256u;
+const uint TRI_VIEW_SHIFT = 14u; // texture layer: the split screen view whose camera drew it (2 bits)
+const uint TRI_GLASS = 512u; // remaster glass: a see-through, slightly reflective layer (trace.comp)
 const vec3 ICE_TINT = vec3(0.78, 0.9, 1.0);
 
 float luma(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }
 
-uint vram16(int x, int y)
+// bank: the texture page's bits 12-14 (rtx_shared.h RTX_TPAGE_BANK_SHIFT): 0 the
+// live VRAM, 1..5 an adventure hub's own (the hub world)
+uint vram16(uint bank, int x, int y)
 {
-	uint idx = uint(clamp(y, 0, 511)) * 1024u + uint(x & 1023);
+	bank = (bank > 5u) ? 0u : bank;
+	uint idx = bank * (1024u * 512u) + uint(clamp(y, 0, 511)) * 1024u + uint(x & 1023);
 	uint w = vram[idx >> 1];
 	return ((idx & 1u) != 0u) ? (w >> 16) : (w & 0xffffu);
 }
@@ -86,6 +153,7 @@ uint vram16(int x, int y)
 // PS1 texel at integer uv: rgb in 0..1, a = 0 transparent (0x0000)
 vec4 psxTexel(uint tpage, uint clut, int u, int v)
 {
+	uint bank = (tpage >> 12) & 7u;
 	int mode = int((tpage >> 7) & 3u);
 	int bx = int(tpage & 15u) * 64;
 	int by = int((tpage >> 4) & 1u) * 256;
@@ -96,22 +164,47 @@ vec4 psxTexel(uint tpage, uint clut, int u, int v)
 	uint c;
 	if (mode == 0)
 	{
-		uint w = vram16(bx + (u >> 2), by + v);
+		uint w = vram16(bank, bx + (u >> 2), by + v);
 		uint idx = (w >> (uint(u & 3) * 4u)) & 15u;
-		c = vram16(cx + int(idx), cy);
+		c = vram16(bank, cx + int(idx), cy);
 	}
 	else if (mode == 1)
 	{
-		uint w = vram16(bx + (u >> 1), by + v);
+		uint w = vram16(bank, bx + (u >> 1), by + v);
 		uint idx = (w >> (uint(u & 1) * 8u)) & 255u;
-		c = vram16(cx + int(idx), cy);
+		c = vram16(bank, cx + int(idx), cy);
 	}
 	else
 	{
-		c = vram16(bx + u, by + v);
+		c = vram16(bank, bx + u, by + v);
 	}
 	vec3 rgb = vec3(float(c & 31u), float((c >> 5) & 31u), float((c >> 10) & 31u)) / 31.0;
 	return vec4(rgb, (c == 0u) ? 0.0 : 1.0);
+}
+
+// a semi-transparent polygon blends only its texels with the STP bit (15) set;
+// the others are drawn opaque (custom tracks' solid textures: their buildings
+// were see-through)
+bool psxTexelSemi(uint tpage, uint clut, int u, int v)
+{
+	uint bank = (tpage >> 12) & 7u;
+	int mode = int((tpage >> 7) & 3u);
+	int bx = int(tpage & 15u) * 64;
+	int by = int((tpage >> 4) & 1u) * 256;
+	u &= 255;
+	v &= 255;
+	uint c;
+	if (mode == 2)
+	{
+		c = vram16(bank, bx + u, by + v);
+	}
+	else
+	{
+		uint w = vram16(bank, bx + (u >> (2 - mode)), by + v);
+		uint idx = (mode == 0) ? ((w >> (uint(u & 3) * 4u)) & 15u) : ((w >> (uint(u & 1) * 8u)) & 255u);
+		c = vram16(bank, int(clut & 63u) * 16 + int(idx), int((clut >> 6) & 511u));
+	}
+	return (c & 0x8000u) != 0u;
 }
 
 // set around camera hits (trace.comp): their texels are filtered (F.feat.x)
@@ -162,6 +255,188 @@ uint hashU(uint x)
 }
 
 uint byteAt(uint word, uint b) { return (word >> (b * 8u)) & 255u; }
+
+// ---- remaster mesh -----------------------------------------------------------
+
+uint remTri(uint inst, uint prim)
+{
+	return prim + ((inst == INST_REM_ALPHA) ? F.rem.x : (inst == INST_REM_GRASS) ? F.rem.y : (inst == INST_REM_DECAL) ? F.rem.z
+	                : (inst == INST_REM_ANIM) ? F.rem3.x : (inst == INST_REM_PROXY) ? F.rem3.y : 0u);
+}
+
+// (dynamic vertices where wind.comp has them)
+bool remDynamic(uint v) { return ((F.rem.w & 2u) != 0u) && (v >= F.rem2.x); }
+vec3 remPos(uint v)
+{
+	if (remDynamic(v))
+	{
+		uint g = (v - F.rem2.x) * 5u;
+		return uintBitsToFloat(uvec3(remGrass[g], remGrass[g + 1u], remGrass[g + 2u]));
+	}
+	return vec3(uintBitsToFloat(remVerts[v * 8u]), uintBitsToFloat(remVerts[v * 8u + 1u]), uintBitsToFloat(remVerts[v * 8u + 2u]));
+}
+vec2 remUv(uint v) { return vec2(uintBitsToFloat(remVerts[v * 8u + 3u]), uintBitsToFloat(remVerts[v * 8u + 4u])); }
+vec4 remColor(uint v) { return unpackUnorm4x8(remVerts[v * 8u + 6u]); }
+
+vec3 octDecode(uint bits)
+{
+	vec2 e = unpackSnorm2x16(bits);
+	vec3 n = vec3(e, 1.0 - abs(e.x) - abs(e.y));
+	if (n.z < 0.0)
+	{
+		n.xy = (1.0 - abs(n.yx)) * vec2((n.x >= 0.0) ? 1.0 : -1.0, (n.y >= 0.0) ? 1.0 : -1.0);
+	}
+	return normalize(n);
+}
+
+// baked mode: the light baked at a remaster triangle's corners, at bary
+vec3 remBakedAt(uint inst, uint prim, vec2 bary)
+{
+	uint t = remTri(inst, prim);
+	vec3 w = vec3(1.0 - bary.x - bary.y, bary.x, bary.y);
+	return remBake[remIdx[t * 3u]].rgb * w.x + remBake[remIdx[t * 3u + 1u]].rgb * w.y + remBake[remIdx[t * 3u + 2u]].rgb * w.z;
+}
+
+vec3 remNormal(uint v) { return octDecode(remDynamic(v) ? remGrass[(v - F.rem2.x) * 5u + 3u] : remVerts[v * 8u + 5u]); }
+
+// tangent (xyz) and bitangent sign (w), normal mapped materials' vertices
+vec4 remTangent(uint v)
+{
+	uint bits = remDynamic(v) ? remGrass[(v - F.rem2.x) * 5u + 4u] : remVerts[v * 8u + 7u];
+	return vec4(octDecode(bits), ((bits & 0x10000u) != 0u) ? 1.0 : -1.0);
+}
+
+// texture level of detail at a hit: how many uv units a traced pixel spans
+// there (the triangle's uv density x the pixel's size at its distance from the
+// camera), in log2; plus log2 of a texture's size (remSample). Secondary rays: blurrier
+float remLodBase(vec3 p0, vec3 p1, vec3 p2, vec2 t0, vec2 t1, vec2 t2, vec3 pos, bool camera)
+{
+	vec2 a = t1 - t0, b = t2 - t0;
+	float uvArea = abs(a.x * b.y - a.y * b.x);
+	float area = length(cross(p1 - p0, p2 - p0));
+	float pixel = length(pos - V.camPos.xyz) * V.proj2.y / (float(F.size.x) * V.proj.x);
+	return 0.5 * log2(max(uvArea / max(area, 1e-12), 1e-20)) + log2(max(pixel, 1e-6)) + (camera ? 0.0 : 2.0);
+}
+
+vec4 remSample(uint tex, vec2 uv, float lodBase)
+{
+	if (tex == 0xffffffffu)
+	{
+		return vec4(0.5, 0.5, 0.5, 1.0);
+	}
+	vec2 size = vec2(textureSize(remTex[nonuniformEXT(tex)], 0));
+	return textureLod(remTex[nonuniformEXT(tex)], uv, lodBase + 0.5 * log2(size.x * size.y));
+}
+
+// a running light layer's colour (MAT_UV_SCROLL2: Oxide Station's floor lights,
+// one long pulse per ten panels at about kart speed): the pulse's own colour
+// (yellow, orange at its ends) over its band's centre colour, so the channels
+// glow yellow between pulses too rather than going dark ahead of the kart
+vec3 remRunningLight(uvec4 m, vec4 c1, vec2 uv2, float lod2)
+{
+	return mix(remSample(m.y, vec2(0.5, uv2.y), lod2).rgb, c1.rgb, c1.a);
+}
+
+// a material's colour at uv: blended ones (Alchemy UberShaderBlended) show their
+// second layer where the vertex alpha says, its edge following both layers'
+// height (texture alpha); blend = how much of the second layer. dirMask: where
+// a directional blend allows the second layer (snow on rocks' tops), else 1.
+// texMap (MAT_BLEND_TEX): the first layer shows where its alpha x texMap.x +
+// texMap.y is high (no vertex colours: Oxide Station's floor panels, its
+// lights between them). uv2, lod2: the second layer's (remUv2)
+vec4 remAlbedo(uvec4 m, vec2 uv, vec2 uv2, float vertexAlpha, float dirMask, vec2 texMap, float lodBase, float lod2, out float blend)
+{
+	vec4 c0 = remSample(m.x, uv, lodBase);
+	blend = 0.0;
+	if ((m.w & MAT_BLEND2) == 0u)
+	{
+		return c0;
+	}
+	vec4 c1 = remSample(m.y, uv2, lod2);
+	bool running = ((m.w & MAT_UV_SCROLL2) != 0u) && ((m.w & MAT_EMIT_MASK) != 0u); // (a glowing layer: not a VFX's)
+	vec3 c1rgb = running ? remRunningLight(m, c1, uv2, lod2) : c1.rgb;
+	if ((m.w & MAT_BLEND_TEX) != 0u)
+	{
+		blend = smoothstep(0.4, 0.6, 1.0 - clamp(c0.a * texMap.x + texMap.y, 0.0, 1.0));
+		return vec4(mix(c0.rgb, c1rgb, blend), 1.0);
+	}
+	float a = vertexAlpha * dirMask;
+	float x = a + (c1.a - c0.a) * 0.5 * (1.0 - abs(a * 2.0 - 1.0));
+	blend = smoothstep(0.4, 0.6, x);
+	return vec4(mix(c0.rgb, c1rgb, blend), 1.0);
+}
+
+// a blended material's second layer uvs: as the first's, or (MAT_UV_SCROLL2:
+// Alchemy's texture matrix animation) scaled about the texture's centre and
+// scrolling (Oxide Station's floor lights running down the road); lod: its
+// mip bias for the scale
+vec2 remUv2(uvec4 m, uint mi, vec2 uv, inout float lod)
+{
+	if ((m.w & MAT_UV_SCROLL2) == 0u)
+	{
+		return uv;
+	}
+	uvec4 tint = remMats[mi * 3u + 2u];
+	vec2 scale = unpackHalf2x16(tint.z), scroll = unpackHalf2x16(tint.w);
+	lod += 0.5 * log2(max(abs(scale.x * scale.y), 1e-6));
+	return (uv - 0.5) * scale + 0.5 + fract(scroll * F.params.y);
+}
+
+// the first layer's uvs: as stored, or (MAT_UV_SCROLL1: Alchemy's texture matrix
+// animation) scaled about the texture's centre and scrolling (waterfalls)
+vec2 remUv1(uvec4 m, uint mi, vec2 uv, inout float lod)
+{
+	if ((m.w & MAT_UV_SCROLL1) == 0u)
+	{
+		return uv;
+	}
+	uvec4 tint = remMats[mi * 3u + 2u];
+	vec2 scale = unpackHalf2x16(tint.x), scroll = unpackHalf2x16(tint.y);
+	lod += 0.5 * log2(max(abs(scale.x * scale.y), 1e-6));
+	return (uv - 0.5) * scale + 0.5 + fract(scroll * F.params.y);
+}
+
+// tangent space normal from a BC5 normal map (x, y; z rebuilt)
+vec3 remNormalSample(uint tex, vec2 uv, float lodBase)
+{
+	vec2 xy = remSample(tex, uv, lodBase).rg * 2.0 - 1.0;
+	xy.y = ((F.rem.w & 4u) != 0u) ? -xy.y : xy.y;
+	return vec3(xy, sqrt(max(1.0 - dot(xy, xy), 0.0)));
+}
+
+// a remaster candidate (alpha tested part) is hit: cut-outs by texture alpha;
+// decals (they sit just over the surface they decorate) for camera rays only,
+// dithered by their alpha (TAA smooths it); water and glass for camera rays only
+bool remAccept(uint inst, uint prim, vec2 bary, bool includeSemi)
+{
+	uint t = remTri(inst, prim);
+	uint mi = remTriMat[t];
+	uvec4 m = remMats[mi * 3u];
+	if ((m.w & (MAT_WATER | MAT_GLASS)) != 0u)
+	{
+		return includeSemi;
+	}
+	if ((m.w & (MAT_ALPHA_CLIP | MAT_TRANSLUCENT)) == 0u)
+	{
+		return true;
+	}
+	vec3 w = vec3(1.0 - bary.x - bary.y, bary.x, bary.y);
+	uint v0 = remIdx[t * 3u], v1 = remIdx[t * 3u + 1u], v2 = remIdx[t * 3u + 2u];
+	vec2 t0 = remUv(v0), t1 = remUv(v1), t2 = remUv(v2);
+	vec3 p0 = remPos(v0), p1 = remPos(v1), p2 = remPos(v2);
+	vec2 uv = t0 * w.x + t1 * w.y + t2 * w.z;
+	float lod = remLodBase(p0, p1, p2, t0, t1, t2, p0 * w.x + p1 * w.y + p2 * w.z, includeSemi);
+	uv = remUv1(m, mi, uv, lod);
+	float a = remSample(m.x, uv, lod).a;
+	a *= ((m.w & MAT_TRANSLUCENT) != 0u) ? uintBitsToFloat(remMats[mi * 3u + 2u].w) : 1.0; // (the material colour's alpha)
+	if (((m.w & MAT_TRANSLUCENT) != 0u) && includeSemi)
+	{
+		// alpha blended: camera rays see it in proportion to its alpha (dithered, TAA smooths)
+		uint h = hashU(floatBitsToUint(bary.x) ^ hashU(floatBitsToUint(bary.y) ^ (F.size.z * 0x9e3779b9u)));
+		return a > float(h) * (1.0 / 4294967296.0);
+	}
+	return a >= (((m.w & MAT_TRANSLUCENT) != 0u) ? 0.5 : uintBitsToFloat(remMats[mi * 3u + 1u].z));
+}
 
 vec3 levelPos(uint v)
 {
@@ -847,7 +1122,7 @@ vec3 skyRadiance(vec3 d)
 
 float rayEps(vec3 p)
 {
-	return F.skyHorizon.w + 1e-4 * length(p - F.camPos.xyz);
+	return F.skyHorizon.w + 1e-4 * length(p - V.camPos.xyz);
 }
 
 // low-poly models self-shadow along their facets: push their rays further out

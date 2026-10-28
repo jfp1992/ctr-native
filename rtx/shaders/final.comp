@@ -34,6 +34,15 @@ void main()
 		return;
 	}
 	uint idx = px.y * F.size.x + px.x;
+	// split screen: the bars between the views stay black
+	int cam = viewOfPixel(ivec2(px), F.size.xy);
+	if (cam < 0)
+	{
+		glowOut[idx] = vec4(0.0);
+		dispOut[idx] = vec4(0.0, 0.0, 0.0, 1.0);
+		return;
+	}
+	useView(cam);
 	vec4 a = albedoIn[idx];
 	vec4 layer = layerIn[idx];
 	uint view = F.size.w;

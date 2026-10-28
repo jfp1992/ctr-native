@@ -41,6 +41,11 @@
 #define RTX_MAX_H           2160u
 #define RTX_VRAM_W          1024u
 #define RTX_VRAM_H          512u
+// adventure hub world: each hub's own VRAM (the game holds two hubs' textures
+// at a time, in alternating layouts); a texture page's bits 12-14 pick one:
+// 0 the live VRAM, 1..5 hub GEM_STONE_VALLEY + bank - 1
+#define RTX_VRAM_BANKS      5u
+#define RTX_TPAGE_BANK_SHIFT 12
 
 enum RtxTriFlags
 {
@@ -157,6 +162,18 @@ struct RtxLighting
 	struct RtxPointLight lights[RTX_MAX_LIGHTS];
 };
 
+// one player's camera (1P: one; split screen: one per player, each drawn into
+// its own rectangle of the display)
+#define RTX_MAX_VIEWS 4u
+struct RtxView
+{
+	float camR[9];            // GTE camera: view = camR * world + camT (row-major)
+	float camT[3];
+	float projH;              // GTE H (distanceToScreen)
+	float vpX, vpY, vpW, vpH; // 3D viewport in PS1 screen coords (pushBuffer rect)
+	float texNearDepth;       // view z past which the PS1 draws the level with its lower textures (0 = none)
+};
+
 struct RtxHeader
 {
 	uint32_t magic;
@@ -178,15 +195,15 @@ struct RtxHeader
 	int32_t levelID;
 	int32_t redirectBase; // custom track bigfile base, -1 = stock level
 	char lightsKey[64];   // assets/rtx_lights/<key>.json
+	uint32_t vramBanks;   // hub world texture banks in RTX_OFF_HUB_VRAM (0 none), rewritten with the level
+	uint32_t sunFitFirst, sunFitCount; // level vertices the sun is fitted to (count 0: all): the hub world's one sun, N. Sanity Beach's
 
 	// frame
 	uint32_t frame;
 	uint32_t numDynTris;
 	uint32_t outW, outH;   // image size wanted (window viewport)
-	float camR[9];         // GTE camera: view = camR * world + camT (row-major)
-	float camT[3];
-	float projH;           // GTE H (distanceToScreen)
-	float vpX, vpY, vpW, vpH; // 3D viewport in PS1 screen coords (pushBuffer rect)
+	uint32_t numViews;     // players' views this frame (split screen: 2-4)
+	struct RtxView views[RTX_MAX_VIEWS];
 	float dispW, dispH;    // PS1 display size the output image covers
 	uint32_t debugView;    // 0 final, 1 albedo, 2 normal, 3 direct, 4 indirect
 	uint32_t resetHistory;
@@ -221,8 +238,10 @@ _Static_assert(sizeof(struct RtxPointLight) == 48, "RtxPointLight layout");
 #define RTX_OFF_LEVEL_CAP     RTX_ALIGN(RTX_OFF_DYN_TRIS + RTX_MAX_DYN_TRIS * sizeof(struct RtxDynTri))
 #define RTX_OFF_VRAM          RTX_ALIGN(RTX_OFF_LEVEL_CAP + RTX_MAX_LEVEL_CAP * sizeof(struct RtxDynTri))
 #define RTX_SLOT_BYTES        (RTX_MAX_W * RTX_MAX_H * 4u) // one image / depth slot (two of each: frameReq & 1)
-#define RTX_OFF_IMAGE         RTX_ALIGN(RTX_OFF_VRAM + RTX_VRAM_W * RTX_VRAM_H * 2u)
+#define RTX_OFF_HUB_VRAM      RTX_ALIGN(RTX_OFF_VRAM + RTX_VRAM_W * RTX_VRAM_H * 2u)
+#define RTX_OFF_IMAGE         RTX_ALIGN(RTX_OFF_HUB_VRAM + RTX_VRAM_BANKS * RTX_VRAM_W * RTX_VRAM_H * 2u)
 #define RTX_OFF_DEPTH         RTX_ALIGN(RTX_OFF_IMAGE + 2u * RTX_SLOT_BYTES)
-#define RTX_SHM_SIZE          RTX_ALIGN(RTX_OFF_DEPTH + 2u * RTX_SLOT_BYTES)
+#define RTX_OFF_BAKE_OUT      RTX_ALIGN(RTX_OFF_DEPTH + 2u * RTX_SLOT_BYTES)
+#define RTX_SHM_SIZE          RTX_ALIGN(RTX_OFF_BAKE_OUT + RTX_MAX_LEVEL_VERTS * 4u)
 
 #endif
