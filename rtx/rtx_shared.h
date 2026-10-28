@@ -27,7 +27,7 @@
 
 #define RTX_SHM_NAME "/ctr_rtx"
 #define RTX_MAGIC    0x58545243u // 'CRTX'
-#define RTX_VERSION  15u
+#define RTX_VERSION  16u
 
 #define RTX_MAX_LEVEL_VERTS 65536u
 #define RTX_MAX_LEVEL_TRIS  (1u << 19)
@@ -58,6 +58,7 @@ enum RtxTriFlags
 	RTX_TRI_ICE = 64,         // terrain ice (and, renderer side, see-through bluish glass on icy levels): 90% mirror
 	RTX_TRI_SEMI = 128,       // captured polygon drawn semi-transparent (blend from its tpage)
 	RTX_TRI_SMOKE = 256,      // a smoke particle (camera-facing quad): only shadows, partly
+	RTX_TRI_BAKE_STATIC = 1024, // model triangle of a level object that never moves: in the lightmap bake (its shadow is baked)
 	RTX_TRI_VIEW_SHIFT = 14,  // captured level polygons: the view (split screen player) whose camera drew them, 2 bits
 	// water samples its texture slot (the level's water env map) by world position
 	// level triangles are semi-transparent when their texture's blend bits are
@@ -65,6 +66,13 @@ enum RtxTriFlags
 };
 
 // level vertex: world position (level units, Y up) + PS1 vertex colour
+enum RtxLightmapState
+{
+	RTX_LM_NONE,
+	RTX_LM_BAKING,
+	RTX_LM_READY,
+};
+
 struct RtxLevelVert
 {
 	float pos[3];
@@ -109,7 +117,7 @@ struct RtxPointLight
 	float color[3];
 	float falloff;
 	float size;
-	float pad[3];
+	float pad[3]; // dynLights: pad[0] 1 = a glow that stays (a level object's, a torch): in the lightmap bake
 };
 
 #define RTX_MAX_LIGHTS 1024u
@@ -210,6 +218,13 @@ struct RtxHeader
 	volatile uint32_t bakeReq;
 	volatile uint32_t bakeDone;
 	uint32_t bakeRays;
+	// ray tracing off (settings.baked): the level is lit from its lightmap,
+	// traced once per level by the renderer and cached (rtbake/<hash>.lmap).
+	// While lmState is RTX_LM_BAKING the game stands still (nothing moves while
+	// the light settles); lmRebake: the game asks for every lightmap again
+	volatile uint32_t lmState;
+	volatile uint32_t lmProgress; // 0..100
+	volatile uint32_t lmRebake;
 
 	// level (rewritten when levelGen changes)
 	uint32_t levelGen;

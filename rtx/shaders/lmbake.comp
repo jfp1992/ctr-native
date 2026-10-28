@@ -1,0 +1,113 @@
+#version 460
+// Lightmap bake (ray tracing off): the light at every lattice point of the
+// level (common.glsl lightmapAt), gathered as trace.comp lights a camera hit:
+// the sun and static lights with their shadows, the glows that stay, one
+// diffuse bounce. ctr_rtx.c runs it pass after pass over all points (in pieces
+// a frame, the game standing still) until the light settles: each pass adds
+// LM_SAMPLES samples a point; a bounce that meets the level takes the light
+// the lightmap holds there so far (light bounces again with every pass).
+// Rays see the level and the level objects that never move (g_bakeRays):
+// karts and what moves cast their shadows live (trace.comp lightmapLight).
+//
+// mode 0: sample points [first, end); mode 1: resolve [first, end) into
+// lmData (sums / samples), bake statistics into lumSums[LM_STATS..]
+
+#include "common.glsl"
+
+layout(local_size_x = 64) in;
+layout(push_constant) uniform Push
+{
+	uint first;
+	uint end;
+	uint mode;
+	uint pass;  // mode 0: the pass (noise seed); mode 1: passes summed
+	uint flags; // 1: lmData holds an earlier pass's light (bounces take it)
+} pc;
+
+const uint LM_SAMPLES = 64u;
+const uint LM_STATS = 2032u; // (lumSums: the light and how much it changed, every 16th point)
+
+void main()
+{
+	uint k = gl_GlobalInvocationID.x + pc.first;
+	if (k >= pc.end)
+	{
+		return;
+	}
+	if (pc.mode == 1u)
+	{
+		vec4 a = lmAccum[k] / float(max(pc.pass, 1u) * LM_SAMPLES);
+		float before = luma(lmPoint(k).rgb);
+		lmData[k] = uvec2(packHalf2x16(a.rg), packHalf2x16(vec2(a.b, a.a)));
+		if ((k & 15u) == 0u)
+		{
+			float l = luma(a.rgb);
+			atomicAdd(lumSums[LM_STATS], uint(min(l, 64.0) * 64.0));
+			atomicAdd(lumSums[LM_STATS + 1u], uint(min(abs(l - before), 64.0) * 64.0));
+		}
+		return;
+	}
+
+	uint info = lmIndex[lmIndex[0] + k];
+	uint prim = info & 0x7ffffu, side = (info >> 19) & 1u, i = (info >> 20) & 63u, j = (info >> 26) & 63u;
+	uint r = (lmIndex[LM_HEAD + prim * 2u + 1u] >> (side * 8u)) & 0xffu;
+	// (a little inside the triangle: points on its edges and corners would
+	// start their rays right on the neighbours' surfaces)
+	vec2 bary = mix(vec2(float(i), float(j)) / float(r), vec2(1.0 / 3.0), 0.02);
+	vec3 rawN = levelRawNormal(prim);
+	if (dot(rawN, rawN) < 1e-12)
+	{
+		lmAccum[k] = vec4(0.0);
+		return;
+	}
+	g_bakeRays = true;
+	Surface sf = surfaceAt(INST_LEVEL, prim, bary, (side == 0u) ? -rawN : rawN); // (as a ray seeing that side)
+	g_skipLayers = true;
+	vec3 p = sf.pos, n = sf.normal, ng = sf.geoNormal;
+	float eps = surfaceEps(p, false);
+	vec3 pl = sf.shadowPos + ng * (eps - rayEps(p));
+	float aoRadius = (F.ambient.w > 0.5) ? F.params.x : 1e8;
+	bool haveLight = (pc.flags & 1u) != 0u;
+	uint rng = (k * 9781u + 6271u) ^ (pc.pass * 0x9E3779B9u);
+	pcg(rng);
+	pcg(rng);
+
+	vec3 sum = vec3(0.0);
+	float sun = 0.0;
+	for (uint s = 0u; s < LM_SAMPLES; s++)
+	{
+		g_remSurf = false;
+		g_sunOut = 0.0;
+		sum += lightSample(pl, n, ng, false, rng);
+		sun += g_sunOut;
+		if (F.extra.x != 0u)
+		{
+			g_skipFold = true; // (as trace.comp dynLightSamples: the floor continuing casts no shadow)
+			g_foldN = ng;
+			sum += dynLightSample(pl, n, ng, rng);
+			g_skipFold = false;
+		}
+		// one diffuse bounce (cosine-weighted)
+		vec3 bd = cosineSample(n, rng);
+		if (dot(bd, ng) <= 0.0)
+		{
+			bd = reflect(bd, ng);
+		}
+		uint hi, hp;
+		vec2 hb;
+		g_fastRays = true;
+		float t = traceClosest(p + ng * eps, bd, aoRadius, false, hi, hp, hb);
+		if (t < 0.0)
+		{
+			sum += skyRadiance(bd);
+		}
+		else
+		{
+			Surface h = surfaceAt(hi, hp, hb, bd);
+			vec3 light = ((hi == INST_LEVEL) && haveLight) ? lightmapAt(hp, hb, bd).rgb : lightSample(h.shadowPos, h.normal, h.geoNormal, h.dynamic, rng);
+			sum += h.albedo * light + h.emission / max(F.sunColor.w, 1e-3);
+		}
+		g_fastRays = false;
+	}
+	lmAccum[k] += vec4(sum, sun);
+}

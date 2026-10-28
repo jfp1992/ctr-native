@@ -66,6 +66,10 @@ vec3 shadeSecondary(vec3 o, vec3 d, float tmax, bool fast, inout uint rng)
 		{
 			result = s.albedo * s.ps1Light; // hybrid: what the PS1 draws there
 		}
+		else if (((F.rem.w & 32u) != 0u) && (inst == INST_LEVEL))
+		{
+			result = s.albedo * lightmapAt(prim, bary, d).rgb; // lightmap mode: the level's light as baked
+		}
 		else
 		{
 			// direct light there, plus what the cache has learnt reaches it indirectly;
@@ -348,6 +352,22 @@ bool capAlong(vec3 o, vec3 d, out uint prim, out vec2 bary, out float t)
 // emitter light (flames, turbos): no history (see below), so at least
 // DYN_SAMPLES a pixel, spread over its samples (count each)
 const uint DYN_SAMPLES = 4u;
+// lightmap mode (ray tracing off): a level point's baked light, less the sun
+// where what the bake left out (karts, what moves) stands in its way
+vec3 lightmapLight(uint prim, vec2 bary, vec3 dir, vec3 pl, vec3 ng)
+{
+	vec4 lm = lightmapAt(prim, bary, dir);
+	if ((lm.a > 0.01) && (F.ambient.w < 0.5))
+	{
+		vec3 l = coneSampleU(F.sunDir.xyz, F.sunDir.w, g_bnSun);
+		g_liveShadow = true;
+		bool blocked = (dot(ng, l) > 0.0) && occludedMask(pl + ng * rayEps(pl), l, 1e7, 0x2u);
+		g_liveShadow = false;
+		lm.rgb = blocked ? max(lm.rgb - F.sunColor.rgb * lm.a, vec3(0.0)) : lm.rgb;
+	}
+	return lm.rgb;
+}
+
 vec3 dynLightSamples(vec3 p, vec3 n, vec3 ng, bool dynamic, uint count, inout uint rng)
 {
 	if (F.extra.x == 0u)
@@ -778,6 +798,9 @@ void main()
 		spp = max(spp, ((shown < 0.05) ? 3u : 2u) * baseSpp);
 	}
 	spp = min(spp, max(baseSpp, 128u)); // (64 spp set: dark pixels at 2x, not a 192-sample dispatch)
+	// (lightmap mode: a level point's light is looked up, one sample is all there is)
+	bool lmHit = ((F.rem.w & 32u) != 0u) && (inst == INST_LEVEL) && !sf.dynamic;
+	spp = lmHit ? 1u : spp;
 
 	// where this surface was last frame (its history, its light pick): same
 	// depth, facing, and kind of surface (floor behind a moving kart would
@@ -879,13 +902,13 @@ void main()
 		g_bnSun = blueNoise2(px, si, 1u);
 		// (baked mode: the remaster's light as rembake.comp left it, no rays)
 		bool bakedHit = ((F.rem.w & 16u) != 0u) && (inst >= INST_REM) && !sf.dynamic;
-		vec3 direct = bakedHit ? remBakedAt(inst, prim, bary) : lightSample(pl, n, ng, sf.dynamic, rng);
+		vec3 direct = bakedHit ? remBakedAt(inst, prim, bary) : (lmHit ? lightmapLight(prim, bary, dir, pl, ng) : lightSample(pl, n, ng, sf.dynamic, rng));
 		g_useBn = false;
 		g_specOn = false;
 		// a pick whose light is blocked here isn't carried on (visibility reuse)
 		lastRes.y = g_lightBlocked ? 0.0 : lastRes.y;
 		g_modelEmit = sf.dynamic;
-		dynLight += bakedHit ? vec3(0.0) : dynLightSamples(pl, n, ng, sf.dynamic, max((DYN_SAMPLES + spp - 1u) / spp, 1u), rng);
+		dynLight += (bakedHit || lmHit) ? vec3(0.0) : dynLightSamples(pl, n, ng, sf.dynamic, max((DYN_SAMPLES + spp - 1u) / spp, 1u), rng);
 		g_modelEmit = false;
 		if (F.extra.z == 0u)
 		{
@@ -912,7 +935,7 @@ void main()
 			}
 			float aoRadius = (F.ambient.w > 0.5) ? F.params.x : 1e8;
 			// (indoors a bounce that gets past the AO radius sees the ambient: skyRadiance)
-			vec3 indirect = (bakedHit || (abs(F.params.w - 4.0) < 0.5)) ? vec3(0.0) : shadeSecondary(p + ng * eps, bd, aoRadius, true, rng); // experiment 4: no bounce (timing)
+			vec3 indirect = (bakedHit || lmHit || (abs(F.params.w - 4.0) < 0.5)) ? vec3(0.0) : shadeSecondary(p + ng * eps, bd, aoRadius, true, rng); // experiment 4: no bounce (timing)
 			lighting += direct + indirect;
 			indirectSum += indirect;
 		}

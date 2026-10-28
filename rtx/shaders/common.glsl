@@ -132,6 +132,15 @@ layout(set = 1, binding = 5) uniform samplerCube remSky;                        
 layout(set = 1, binding = 6, std430) buffer RemGrass { uint remGrass[]; };           // dynamic vertices as wind.comp moved them (grass, animated, proxies): position, normal, tangent (5 words)
 layout(set = 1, binding = 7, std430) readonly buffer RemAnim { uint remAnim[]; };      // moving parts, keys, their vertices, proxy slots (scripts/nf_level.py)
 layout(set = 1, binding = 8, std430) buffer RemBake { vec4 remBake[]; };               // baked mode (F.rem.w & 16): light at each vertex (rembake.comp)
+// lightmap (ray tracing off: F.rem.w & 32): lattice points over every level
+// triangle, both sides, baked by lmbake.comp. lmIndex: [0] where the points'
+// records start, from LM_HEAD per triangle (first point, lattice size), then per
+// point (triangle, side, lattice i, j); a triangle's lattice size is per side
+// (bits 0-7 its own winding's side, 8-15 the other)
+layout(set = 0, binding = 46, std430) readonly buffer LmIndex { uint lmIndex[]; };
+layout(set = 0, binding = 47, std430) buffer LmData { uvec2 lmData[]; };   // light at each point: rgb, sun (visibility x cos, x F.sunColor) as half floats
+layout(set = 0, binding = 48, std430) buffer LmAccum { vec4 lmAccum[]; };  // while baking: sums of rgb, sun
+const uint LM_HEAD = 4u;
 
 const uint INST_LEVEL = 0u;
 const uint INST_DYN = 1u;
@@ -165,6 +174,8 @@ bool g_remSurf = false;
 // the level as opaque, settled by the RT hardware. Indirect light is soft:
 // colour-keyed holes and see-through polygons count as solid there
 bool g_fastRays = false;
+bool g_bakeRays = false;   // lightmap bake: of the models only level objects that never move, of the glows only those that stay
+bool g_liveShadow = false; // lightmap mode: what the bake left out (karts, what moves) casts the sun's shadow
 
 const uint TRI_TEXTURED = 1u;
 const uint TRI_DOUBLE_SIDED = 2u;
@@ -177,6 +188,7 @@ const uint TRI_SEMI = 128u;
 const uint TRI_SMOKE = 256u;
 const uint TRI_VIEW_SHIFT = 14u; // texture layer: the split screen view whose camera drew it (2 bits)
 const uint TRI_GLASS = 512u; // remaster glass: a see-through, slightly reflective layer (trace.comp)
+const uint TRI_BAKE_STATIC = 1024u; // model triangle of a level object that never moves: in the lightmap bake
 const vec3 ICE_TINT = vec3(0.78, 0.9, 1.0);
 
 float luma(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }
@@ -484,6 +496,55 @@ vec3 levelPos(uint v)
 	return vec3(uintBitsToFloat(levelVerts[v * 4u]), uintBitsToFloat(levelVerts[v * 4u + 1u]), uintBitsToFloat(levelVerts[v * 4u + 2u]));
 }
 
+// ---- lightmap (ray tracing off) ---------------------------------------------
+// each level triangle has a lattice of (r+1)(r+2)/2 points a side, point (i, j)
+// at barycentrics (i/r, j/r); side 0 faces along its own winding's normal
+
+// a level triangle's normal by its own winding (not oriented)
+vec3 levelRawNormal(uint prim)
+{
+	uint w0 = levelTris[prim * 3u], w1 = levelTris[prim * 3u + 1u];
+	vec3 p0 = levelPos(w0 & 0xffffu), p1 = levelPos(w0 >> 16), p2 = levelPos(w1 & 0xffffu);
+	return cross(p1 - p0, p2 - p0);
+}
+
+uint lmCount(uint r) { return (r + 1u) * (r + 2u) / 2u; }
+uint lmLattice(uint i, uint j, uint r) { return j * (r + 1u) - (j * (j - 1u)) / 2u + i; }
+
+vec4 lmPoint(uint k)
+{
+	uvec2 q = lmData[k];
+	return vec4(unpackHalf2x16(q.x), unpackHalf2x16(q.y));
+}
+
+// the baked light (rgb, sun term) where a ray along d meets level triangle prim:
+// linear between the lattice points around it
+vec4 lightmapAt(uint prim, vec2 bary, vec3 d)
+{
+	uint base = lmIndex[LM_HEAD + prim * 2u], rs = lmIndex[LM_HEAD + prim * 2u + 1u], r = rs & 0xffu;
+	if (r == 0u)
+	{
+		return vec4(0.0);
+	}
+	if (dot(levelRawNormal(prim), d) >= 0.0)
+	{
+		base += lmCount(r); // (the other side)
+		r = (rs >> 8) & 0xffu;
+	}
+	vec2 uv = clamp(bary, 0.0, 1.0) * float(r);
+	float s = uv.x + uv.y, lim = float(r) - 1e-3;
+	uv *= (s > lim) ? lim / s : 1.0;
+	vec2 c = floor(uv), f = uv - c;
+	uint i = uint(c.x), j = uint(c.y);
+	if (f.x + f.y <= 1.0)
+	{
+		return lmPoint(base + lmLattice(i, j, r)) * (1.0 - f.x - f.y) + lmPoint(base + lmLattice(i + 1u, j, r)) * f.x +
+		       lmPoint(base + lmLattice(i, j + 1u, r)) * f.y;
+	}
+	return lmPoint(base + lmLattice(i + 1u, j + 1u, r)) * (f.x + f.y - 1.0) + lmPoint(base + lmLattice(i, j + 1u, r)) * (1.0 - f.x) +
+	       lmPoint(base + lmLattice(i + 1u, j, r)) * (1.0 - f.y);
+}
+
 vec3 levelCol(uint v)
 {
 	uint c = levelVerts[v * 4u + 3u];
@@ -760,6 +821,10 @@ bool candidateAccept(uint inst, uint prim, vec2 bary, bool includeSemi)
 	else
 	{
 		flags = dynWord(inst, prim, 14u) >> 16;
+		if ((inst == INST_DYN) && ((g_bakeRays && ((flags & TRI_BAKE_STATIC) == 0u)) || (g_liveShadow && ((flags & TRI_BAKE_STATIC) != 0u))))
+		{
+			return false;
+		}
 		clut = dynWord(inst, prim, 10u) >> 16;
 		tpage = dynWord(inst, prim, 11u) & 0xffffu;
 		blend = ((inst == INST_CAP) && ((flags & TRI_SEMI) != 0u)) ? ((tpage >> 5) & 3u) : 3u;
@@ -1472,6 +1537,7 @@ vec3 sampleLightSet(uint first, uint count, vec3 p, vec3 n, vec3 ng, float eps, 
 		float d2 = max(dot(toL, toL), 1.0);
 		float ndl = max(dot(n, toL * inversesqrt(d2)), 0.0);
 		float w = luma(l1.rgb) * ndl * lightFalloff(d2, l1.w);
+		w = (g_bakeRays && (j >= F.counts.x) && (lights[j * 3u + 2u].y < 0.5)) ? 0.0 : w; // (the bake: glows that stay only)
 		wsum += w;
 		if (rnd(rng) * wsum < w)
 		{
@@ -1536,6 +1602,7 @@ vec3 g_specV = vec3(0.0);   // towards the viewer
 float g_specRough = 0.7;    // perceptual roughness
 vec3 g_specF0 = vec3(0.04);
 vec3 g_specOut = vec3(0.0);
+float g_sunOut = 0.0; // sun light the samples got (visibility x cos): the lightmap bake keeps it apart
 vec3 g_specLast = vec3(0.0); // (shadeStaticLight -> sampleStaticLights, before its RIS weight)
 
 vec3 fresnelSchlick(vec3 f0, float c)
@@ -1687,6 +1754,7 @@ vec3 lightSampleAll(vec3 p, vec3 n, vec3 ng, bool dynamic, inout uint rng)
 		if ((ndl > 0.0) && facesLight(ng, l) && !shadowRay(p, n, ng, l, 1e7, eps))
 		{
 			result += F.sunColor.rgb * ndl;
+			g_sunOut += ndl;
 			g_specOut += g_specOn ? F.sunColor.rgb * ggxSpecular(n, g_specV, l, g_specRough, g_specF0) : vec3(0.0);
 		}
 	}

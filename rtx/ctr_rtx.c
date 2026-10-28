@@ -14,6 +14,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <dirent.h>
 #include <math.h>
 #include <setjmp.h>
 #include <signal.h>
@@ -163,6 +164,9 @@ enum
 	B_FOG_CUR,
 	B_LAYER_PREV, // see-through layer's reflection, its own short history
 	B_LAYER_CUR,
+	B_LM_INDEX, // lightmap (ray tracing off): its layout, the light at its points, the bake's sums
+	B_LM_DATA,
+	B_LM_ACCUM,
 	B_COUNT
 };
 
@@ -210,7 +214,7 @@ static struct
 	VkPipelineLayout pipeLayout;
 	VkDescriptorPool descPool;
 	VkDescriptorSet sets[2][PASS_COUNT];
-	VkPipeline pipeTrace, pipeAtrous, pipeFinal, pipeLights, pipeCache, pipeSunfit, pipeBloom, pipeBake, pipeTaa, pipeWind, pipeRemBake;
+	VkPipeline pipeTrace, pipeAtrous, pipeFinal, pipeLights, pipeCache, pipeSunfit, pipeBloom, pipeBake, pipeTaa, pipeWind, pipeRemBake, pipeLmBake;
 
 	// shared memory
 	uint8_t *shm;
@@ -243,6 +247,20 @@ static struct
 	uint32_t remNumTex;
 	Buf remVerts, remIdx, remTriMat, remMats, remDummy;
 	Buf remBake;   // baked mode: light per remaster vertex (rembake.comp)
+	// lightmap (ray tracing off on a PS1 level): lattice points over every level
+	// triangle (common.glsl lightmapAt), baked by lmbake.comp pass after pass
+	Buf lmIndex, lmData, lmAccum, lmDummy;
+	uint32_t lmPoints;
+	int8_t *lmFront;          // per level triangle: 1 its own winding's side is the front, -1 the other, 0 unknown / double-sided
+	uint64_t lmHash;
+	int lmState;              // RTX_LM_*
+	int lmSetsDirty;          // (its buffers changed: the descriptor sets again)
+	uint32_t lmWarm;          // frames waited before the first pass (the level's lights found, glows settled)
+	uint32_t lmPass, lmAcc;   // passes done, passes in the sums (the first few only build up the bounces)
+	uint32_t lmNext, lmChunk; // next point of this pass, points a dispatch
+	uint32_t lmRebakeSeen;
+	float lmChange[4];        // how much the light changed in the last passes (relative)
+	double lmT0;
 	int remBaked;  // (remBake holds this remaster's: baked or read from its cache)
 	char remKey[64];
 	uint64_t remStamp[2]; // the .rtxm's size and mtime (the bake cache's key)
@@ -738,7 +756,7 @@ static void initPipelines(void)
 	R.remDummy = bufCreate(256, USAGE_STORAGE, DEVICE_LOCAL);
 	remWriteSet();
 
-	VkPushConstantRange pcr = {VK_SHADER_STAGE_COMPUTE_BIT, 0, 4};
+	VkPushConstantRange pcr = {VK_SHADER_STAGE_COMPUTE_BIT, 0, 32};
 	VkDescriptorSetLayout setLayouts[2] = {R.setLayout, R.remLayout};
 	VkPipelineLayoutCreateInfo pli = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 2, .pSetLayouts = setLayouts, .pushConstantRangeCount = 1,
 	                                  .pPushConstantRanges = &pcr};
@@ -758,6 +776,8 @@ static void initPipelines(void)
 
 	R.pipeTrace = makePipeline("trace");
 	R.pipeRemBake = makePipeline("rembake");
+	R.pipeLmBake = makePipeline("lmbake");
+	R.lmDummy = bufCreate(256, USAGE_STORAGE, DEVICE_LOCAL);
 	R.pipeAtrous = makePipeline("atrous");
 	R.pipeFinal = makePipeline("final");
 	R.pipeLights = makePipeline("lights");
@@ -2780,9 +2800,12 @@ static void cornerNormals(const struct RtxLevelVert *verts, const struct RtxLeve
 	free(key);
 }
 
+static void lmFree(void);
+
 static void loadLevel(void)
 {
 	vkDeviceWaitIdle(R.dev);
+	lmFree(); // (the lightmap was the last level's)
 	bufDestroy(&R.levelVerts);
 	bufDestroy(&R.levelTris);
 	bufDestroy(&R.levelIdx);
@@ -2851,6 +2874,12 @@ static void loadLevel(void)
 	free(nrmAll);
 	free(fn);
 	free(fu);
+	free(R.lmFront);
+	R.lmFront = malloc(nt ? nt : 1);
+	for (uint32_t i = 0; i < nt; i++)
+	{
+		R.lmFront[i] = ((abs(orient[i]) != 1) || (tris[i].flags & RTX_TRI_DOUBLE_SIDED)) ? 0 : ((orient[i] > 0) ? 1 : -1);
+	}
 	free(orient);
 	for (uint32_t i = 0; i < nv; i++)
 	{
@@ -3951,7 +3980,8 @@ static void writeSets(void)
 			                   &R.cacheKeys, &R.cacheAccum, &R.cacheVal, &R.lightGrid, &R.fit, &R.capTris,
 			                   &R.histDyn[par ^ 1], &R.histDyn[par], &R.combined, &R.bake, &R.levelTint, &R.moments[par ^ 1], &R.moments[par], &R.reservoir[par ^ 1], &R.reservoir[par],
 			                   &R.disp, &R.taaHist[par ^ 1], &R.taaHist[par], &R.blueNoise, &R.spec[par ^ 1], &R.spec[par],
-			                   &R.fog[par ^ 1], &R.fog[par], &R.layerHist[par ^ 1], &R.layerHist[par]};
+			                   &R.fog[par ^ 1], &R.fog[par], &R.layerHist[par ^ 1], &R.layerHist[par],
+			                   R.lmIndex.buf ? &R.lmIndex : &R.lmDummy, R.lmData.buf ? &R.lmData : &R.lmDummy, R.lmAccum.buf ? &R.lmAccum : &R.lmDummy};
 			VkDescriptorBufferInfo infos[B_COUNT];
 			VkWriteDescriptorSet w[B_COUNT];
 			VkWriteDescriptorSetAccelerationStructureKHR asw = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR, .accelerationStructureCount = 1,
@@ -4270,6 +4300,366 @@ static void writeProbe(const uint32_t *lum, uint32_t nd)
 	logf_("probe written to %s", path);
 }
 
+// ---- lightmap (ray tracing off) -----------------------------------------------
+// The level lit as the full tracer lights it, baked once per level: lattice
+// points over each level triangle, both sides, at about LM_TEXEL units apart
+// (fewer when there would be more than LM_MAX_POINTS); where the front side is
+// known (levelOrient) the back gets only its corners. lmbake.comp gathers
+// LM_SAMPLES samples a point a pass; the first LM_GI_PASSES passes only build
+// up the bounces (each bounce takes the light the lightmap has so far), then
+// passes are summed until the light settles: at least LM_MIN_PASSES, until it
+// changes less than LM_SETTLED a pass, at most LM_MAX_PASSES. The game stands
+// still meanwhile (lmState). Cached as rtbake/<hash of the mesh>.lmap.
+
+#define LM_VERSION    2u
+#define LM_TEXEL      16.0f
+#define LM_MAX_RES    32u
+#define LM_MAX_POINTS (6u << 20)
+#define LM_SAMPLES    64u // (lmbake.comp)
+#define LM_GI_PASSES  4u
+#define LM_MIN_PASSES 32u
+#define LM_MAX_PASSES 64u
+#define LM_SETTLED    0.002f
+#define LM_WARM       60u   // frames before the first pass
+#define LM_SLICE_MS   25.0  // bake time a frame
+#define LM_STATS      2032u // (lmbake.comp: lumSums)
+#define LM_HEAD_WORDS 4u    // (common.glsl LM_HEAD)
+
+static void lmFree(void)
+{
+	if (R.lmIndex.buf || R.lmData.buf || R.lmAccum.buf)
+	{
+		vkDeviceWaitIdle(R.dev);
+		R.lmSetsDirty = 1;
+	}
+	bufDestroy(&R.lmIndex);
+	bufDestroy(&R.lmData);
+	bufDestroy(&R.lmAccum);
+	R.lmPoints = 0;
+	R.lmState = RTX_LM_NONE;
+}
+
+static void lmCachePath(char *path, size_t size)
+{
+	snprintf(path, size, "%s/rtbake/%016llx.lmap", s_exeDir, (unsigned long long)R.lmHash);
+}
+
+// Settings "Rebake light": every level's lightmap is baked again when it next loads
+static void lmDeleteCaches(void)
+{
+	char dir[1100], path[1400];
+	snprintf(dir, sizeof(dir), "%s/rtbake", s_exeDir);
+	DIR *d = opendir(dir);
+	int n = 0;
+	for (struct dirent *e = d ? readdir(d) : NULL; e != NULL; e = readdir(d))
+	{
+		size_t l = strlen(e->d_name);
+		if ((l > 5) && !strcmp(e->d_name + l - 5, ".lmap"))
+		{
+			snprintf(path, sizeof(path), "%s/%s", dir, e->d_name);
+			n += unlink(path) == 0;
+		}
+	}
+	if (d)
+	{
+		closedir(d);
+	}
+	logf_("lightmaps: %d cached ones deleted (baked again)", n);
+}
+
+// the lattice over the uploaded level, uploaded (lmIndex) with room for its light
+static int lmLayout(void)
+{
+	uint32_t nv = R.hdr->numLevelVerts, nt = R.hdr->numLevelTris;
+	const struct RtxLevelVert *verts = (const void *)(R.shm + RTX_OFF_LEVEL_VERTS);
+	const struct RtxLevelTri *tris = (const void *)(R.shm + RTX_OFF_LEVEL_TRIS);
+	if (nt == 0)
+	{
+		return 0;
+	}
+	uint8_t *res = malloc(nt);
+	const int8_t *front = R.lmFront;
+	float texel = LM_TEXEL;
+	uint64_t total = 0;
+	for (int iter = 0; iter < 16; iter++)
+	{
+		total = 0;
+		for (uint32_t i = 0; i < nt; i++)
+		{
+			float edge = 0.0f;
+			for (int c = 0; c < 3; c++)
+			{
+				const float *a = verts[tris[i].v[c]].pos, *b = verts[tris[i].v[(c + 1) % 3]].pos;
+				float dx = a[0] - b[0], dy = a[1] - b[1], dz = a[2] - b[2];
+				edge = fmaxf(edge, sqrtf(dx * dx + dy * dy + dz * dz));
+			}
+			uint32_t r = (uint32_t)ceilf(edge / texel);
+			r = (r < 1u) ? 1u : ((r > LM_MAX_RES) ? LM_MAX_RES : r);
+			res[i] = (uint8_t)r;
+			total += (r + 1u) * (r + 2u) / 2u + ((front && front[i]) ? 3u : (r + 1u) * (r + 2u) / 2u);
+		}
+		if (total <= LM_MAX_POINTS)
+		{
+			break;
+		}
+		texel *= sqrtf((float)total / (float)LM_MAX_POINTS) * 1.05f;
+	}
+	if (total > LM_MAX_POINTS)
+	{
+		free(res);
+		logf_("lightmap: level too big (%llu points)", (unsigned long long)total);
+		return 0;
+	}
+	uint32_t words = LM_HEAD_WORDS + nt * 2u + (uint32_t)total;
+	uint32_t *idx = calloc(words, 4);
+	idx[0] = LM_HEAD_WORDS + nt * 2u;
+	uint32_t off = 0;
+	for (uint32_t i = 0; i < nt; i++)
+	{
+		// (lattice size a side: its own winding's, the other's)
+		uint32_t rs[2] = {res[i], res[i]};
+		if (front && front[i])
+		{
+			rs[(front[i] > 0) ? 1 : 0] = 1u;
+		}
+		idx[LM_HEAD_WORDS + i * 2u] = off;
+		idx[LM_HEAD_WORDS + i * 2u + 1u] = rs[0] | (rs[1] << 8);
+		for (uint32_t side = 0; side < 2u; side++)
+		{
+			uint32_t r = rs[side];
+			for (uint32_t j = 0; j <= r; j++)
+			{
+				for (uint32_t k = 0; k <= r - j; k++)
+				{
+					idx[idx[0] + off++] = i | (side << 19) | (k << 20) | (j << 26);
+				}
+			}
+		}
+	}
+	// (the cache's key: the mesh, and how the lattice is laid over it)
+	uint64_t h = 0xcbf29ce484222325ull;
+	uint32_t key[4] = {LM_VERSION, nv, nt, (uint32_t)total};
+	const uint8_t *parts[3] = {(const uint8_t *)key, (const uint8_t *)verts, (const uint8_t *)tris};
+	size_t sizes[3] = {sizeof(key), sizeof(*verts) * nv, sizeof(*tris) * nt};
+	for (int p = 0; p < 3; p++)
+	{
+		for (size_t b = 0; b < sizes[p]; b++)
+		{
+			// (vertices: positions only, not the colours; triangles: their vertices)
+			if (((p == 1) && ((b % sizeof(*verts)) >= 12)) || ((p == 2) && ((b % sizeof(*tris)) >= 6)))
+			{
+				continue;
+			}
+			h = (h ^ parts[p][b]) * 0x100000001b3ull;
+		}
+	}
+	R.lmHash = h;
+	R.lmPoints = (uint32_t)total;
+	R.lmIndex = uploadBuf(idx, (VkDeviceSize)words * 4, 0);
+	R.lmData = bufCreate((VkDeviceSize)total * 8, USAGE_STORAGE, DEVICE_LOCAL);
+	cmdBegin();
+	vkCmdFillBuffer(R.cmd, R.lmData.buf, 0, VK_WHOLE_SIZE, 0);
+	cmdSubmitWait();
+	free(idx);
+	free(res);
+	R.lmSetsDirty = 1;
+	logf_("lightmap %016llx: %u triangles, %u points (texel %.0f)", (unsigned long long)h, nt, R.lmPoints, texel);
+	return 1;
+}
+
+// lmData <-> the cache file (stage: host memory of its size)
+static int lmCache(int save)
+{
+	char path[1400];
+	snprintf(path, sizeof(path), "%s/rtbake", s_exeDir);
+	mkdir(path, 0755);
+	lmCachePath(path, sizeof(path));
+	VkDeviceSize bytes = (VkDeviceSize)R.lmPoints * 8;
+	uint64_t head[4] = {0x50414D4Cull, LM_VERSION, R.lmPoints, R.lmHash}; // "LMAP"
+	Buf stage = bufCreate(bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, HOST_MEM);
+	int ok = 0;
+	if (save)
+	{
+		cmdBegin();
+		copyBuf(&R.lmData, &stage, bytes);
+		cmdSubmitWait();
+		char tmp[1410];
+		snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+		FILE *f = fopen(tmp, "wb");
+		ok = f && (fwrite(head, sizeof(head), 1, f) == 1) && (fwrite(stage.map, 1, bytes, f) == bytes);
+		ok = (f && (fclose(f) == 0)) && ok;
+		ok = ok && (rename(tmp, path) == 0);
+		if (!ok)
+		{
+			remove(tmp);
+			logf_("lightmap: could not write %s", path);
+		}
+	}
+	else
+	{
+		FILE *f = fopen(path, "rb");
+		uint64_t got[4] = {0};
+		ok = f && (fread(got, sizeof(got), 1, f) == 1) && !memcmp(got, head, sizeof(head)) && (fread(stage.map, 1, bytes, f) == bytes);
+		if (f)
+		{
+			fclose(f);
+		}
+		if (ok)
+		{
+			cmdBegin();
+			copyBuf(&stage, &R.lmData, bytes);
+			cmdSubmitWait();
+		}
+	}
+	bufDestroy(&stage);
+	return ok;
+}
+
+// once a request, before the descriptor sets: what ray tracing off wants of the
+// lightmap (laid out, read from its cache or baking); the game sees lmState
+static void lmUpdate(void)
+{
+	if (R.hdr->lmRebake != R.lmRebakeSeen)
+	{
+		R.lmRebakeSeen = R.hdr->lmRebake;
+		lmDeleteCaches();
+		lmFree();
+	}
+	int want = R.hdr->settings.baked && R.haveLevel && !R.remActive && (R.hdr->numLevelTris > 0);
+	if (!want)
+	{
+		if (R.lmState == RTX_LM_BAKING)
+		{
+			lmFree(); // (ray tracing on: no bake half done)
+			logf_("lightmap bake stopped");
+		}
+		R.hdr->lmState = RTX_LM_NONE;
+		R.hdr->lmProgress = 0;
+		return;
+	}
+	if ((R.lmState == RTX_LM_NONE) && !R.lmPoints && lmLayout())
+	{
+		if (lmCache(0))
+		{
+			R.lmState = RTX_LM_READY;
+			logf_("lightmap %016llx read from its cache", (unsigned long long)R.lmHash);
+		}
+		else
+		{
+			R.lmAccum = bufCreate((VkDeviceSize)R.lmPoints * 16, USAGE_STORAGE, DEVICE_LOCAL);
+			cmdBegin();
+			vkCmdFillBuffer(R.cmd, R.lmAccum.buf, 0, VK_WHOLE_SIZE, 0);
+			cmdSubmitWait();
+			R.lmState = RTX_LM_BAKING;
+			R.lmWarm = R.lmPass = R.lmAcc = R.lmNext = 0;
+			R.lmChunk = 8192;
+			for (int i = 0; i < 4; i++)
+			{
+				R.lmChange[i] = 1.0f;
+			}
+			R.lmT0 = nowMs();
+			logf_("lightmap %016llx: baking", (unsigned long long)R.lmHash);
+		}
+	}
+	R.hdr->lmState = (uint32_t)R.lmState;
+	if (R.lmState == RTX_LM_BAKING)
+	{
+		float done = (float)R.lmPass + (R.lmPoints ? (float)R.lmNext / (float)R.lmPoints : 0.0f);
+		uint32_t pct = (uint32_t)(100.0f * done / (float)(LM_GI_PASSES + LM_MIN_PASSES));
+		R.hdr->lmProgress = (pct > 99u) ? 99u : pct;
+	}
+	else
+	{
+		R.hdr->lmProgress = (R.lmState == RTX_LM_READY) ? 100u : 0u;
+	}
+}
+
+static void lmDispatch(uint32_t mode, uint32_t first, uint32_t count, uint32_t pass, uint32_t flags)
+{
+	uint32_t pc[5] = {first, first + count, mode, pass, flags};
+	vkCmdBindPipeline(R.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, R.pipeLmBake);
+	vkCmdBindDescriptorSets(R.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, R.pipeLayout, 0, 1, &R.sets[R.parity][PASS_TRACE], 0, NULL);
+	vkCmdBindDescriptorSets(R.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, R.pipeLayout, 1, 1, &R.remSet, 0, NULL);
+	vkCmdPushConstants(R.cmd, R.pipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), pc);
+	vkCmdDispatch(R.cmd, (count + 63u) / 64u, 1, 1);
+}
+
+// after a frame while baking: LM_SLICE_MS of passes over the points with this
+// frame's lights and scene (the game stands still: every frame the same)
+static void lmBakeStep(void)
+{
+	if ((R.lmState != RTX_LM_BAKING) || !R.hdr->settings.baked || !R.havePrev)
+	{
+		return;
+	}
+	if (R.lmWarm < LM_WARM)
+	{
+		R.lmWarm++;
+		return;
+	}
+	double t0 = nowMs();
+	while (nowMs() - t0 < LM_SLICE_MS)
+	{
+		uint32_t n = R.lmPoints - R.lmNext;
+		n = (n < R.lmChunk) ? n : R.lmChunk;
+		double d0 = nowMs();
+		cmdBegin();
+		lmDispatch(0u, R.lmNext, n, R.lmPass, (R.lmPass > 0u) ? 1u : 0u);
+		cmdSubmitWait();
+		double dt = nowMs() - d0;
+		// (pieces of about 8 ms: a long dispatch could trip the driver's watchdog)
+		R.lmChunk = (dt < 4.0) ? R.lmChunk * 2u : ((dt > 12.0) ? R.lmChunk / 2u : R.lmChunk);
+		R.lmChunk = (R.lmChunk < 1024u) ? 1024u : ((R.lmChunk > R.lmPoints) ? R.lmPoints : R.lmChunk);
+		R.lmNext += n;
+		if (R.lmNext < R.lmPoints)
+		{
+			continue;
+		}
+		// a pass done: the light so far into lmData (the next pass's bounces take it)
+		R.lmNext = 0;
+		R.lmPass++;
+		R.lmAcc++;
+		uint32_t *lum = R.lum.map;
+		lum[LM_STATS] = lum[LM_STATS + 1] = 0;
+		cmdBegin();
+		lmDispatch(1u, 0u, R.lmPoints, R.lmAcc, 0u);
+		cmdSubmitWait();
+		float change = (float)lum[LM_STATS + 1] / (float)(lum[LM_STATS] ? lum[LM_STATS] : 1u);
+		if (R.lmPass <= LM_GI_PASSES)
+		{
+			// (bounces built up: the sums start again with them all)
+			cmdBegin();
+			vkCmdFillBuffer(R.cmd, R.lmAccum.buf, 0, VK_WHOLE_SIZE, 0);
+			cmdSubmitWait();
+			R.lmAcc = 0;
+		}
+		else
+		{
+			memmove(&R.lmChange[1], &R.lmChange[0], sizeof(float) * 3);
+			R.lmChange[0] = change;
+		}
+		float most = fmaxf(fmaxf(R.lmChange[0], R.lmChange[1]), fmaxf(R.lmChange[2], R.lmChange[3]));
+		uint32_t summed = R.lmPass - LM_GI_PASSES;
+		if ((R.lmPass % 8u) == 0u)
+		{
+			logf_("lightmap: pass %u, light changed %.2f%% (%.1f s)", R.lmPass, change * 100.0f, (nowMs() - R.lmT0) / 1000.0);
+		}
+		if ((R.lmPass > LM_GI_PASSES) && (((summed >= LM_MIN_PASSES) && (most < LM_SETTLED)) || (summed >= LM_MAX_PASSES)))
+		{
+			lmCache(1);
+			vkDeviceWaitIdle(R.dev);
+			bufDestroy(&R.lmAccum);
+			R.lmSetsDirty = 1;
+			R.lmState = RTX_LM_READY;
+			R.hdr->lmState = RTX_LM_READY;
+			R.hdr->lmProgress = 100u;
+			logf_("lightmap %016llx baked: %u points, %u passes (%u samples a point), last change %.2f%%, %.1f s", (unsigned long long)R.lmHash, R.lmPoints,
+			      R.lmPass, summed * LM_SAMPLES, change * 100.0f, (nowMs() - R.lmT0) / 1000.0);
+			break;
+		}
+	}
+}
+
 static void renderFrame(void)
 {
 	double tStart = nowMs();
@@ -4285,6 +4675,9 @@ static void renderFrame(void)
 		remBakeRun();
 	}
 	baked = baked && R.remBaked;
+	// ray tracing off on a PS1 level: lit from its lightmap (while it bakes, from
+	// what it has after its first pass; before that, traced as with it on)
+	int lmOn = H->settings.baked && !R.remActive && ((R.lmState == RTX_LM_READY) || ((R.lmState == RTX_LM_BAKING) && (R.lmPass > 0u)));
 	uint32_t nd = H->numDynTris;
 	if (nd > RTX_MAX_DYN_TRIS)
 	{
@@ -4363,7 +4756,7 @@ static void renderFrame(void)
 	{
 		nmFlip = getenv("CTR_RTX_NM_FLIPY") ? (atoi(getenv("CTR_RTX_NM_FLIPY")) != 0) : 0;
 	}
-	F->rem[3] = (R.remActive && R.remSkyView ? 1u : 0u) | (R.remDyn ? 2u : 0u) | (nmFlip ? 4u : 0u) | (R.remWind ? 8u : 0u) | (baked ? 16u : 0u);
+	F->rem[3] = (R.remActive && R.remSkyView ? 1u : 0u) | (R.remDyn ? 2u : 0u) | (nmFlip ? 4u : 0u) | (R.remWind ? 8u : 0u) | (baked ? 16u : 0u) | (lmOn ? 32u : 0u);
 	F->rem2[0] = R.remGrassVert;
 	F->rem2[1] = R.remNumVerts;
 	F->rem3[0] = R.remStart[REM_ANIM];
@@ -4419,7 +4812,7 @@ static void renderFrame(void)
 	F->extra[0] = ndl;
 	F->extra[1] = R.remActive ? 1u : 0u;
 	F->extra[2] = hybrid ? 0u : 1u;
-	F->extra[3] = baked ? 1u : R.spp; // (baked mode: one sample, no rays to average)
+	F->extra[3] = (baked || lmOn) ? 1u : R.spp; // (baked / lightmap mode: one sample, little or nothing to average)
 	F->params2[1] = 24.0f; // radiance cache cell size near the camera
 	// haze: density at the camera's height (outdoors ~90% clear over 10000 units),
 	// e-folding height; CTR_RTX_FOG_DENSITY scales it
@@ -4476,7 +4869,7 @@ static void renderFrame(void)
 	for (uint32_t i = 0; i < ndl; i++)
 	{
 		const struct RtxPointLight *l = &H->dynLights[i];
-		float rec[12] = {l->pos[0], l->pos[1], l->pos[2], 0.0f, l->color[0], l->color[1], l->color[2], l->falloff, l->size, 0, 0, 0};
+		float rec[12] = {l->pos[0], l->pos[1], l->pos[2], 0.0f, l->color[0], l->color[1], l->color[2], l->falloff, l->size, l->pad[0], 0, 0}; // ([9]: stays, lmbake.comp)
 		memcpy(&ls[i * 12], rec, sizeof(rec));
 	}
 	// proxies' lights (a mine cart's headlamp), where their instance is
@@ -4901,6 +5294,7 @@ int main(int argc, char **argv)
 
 	uint32_t lastDone = R.hdr->frameReq;
 	int setsDirty = 1;
+	R.lmRebakeSeen = R.hdr->lmRebake;
 	double idleSince = nowMs();
 	while (!R.hdr->quit)
 	{
@@ -4972,11 +5366,13 @@ int main(int argc, char **argv)
 			resize(inW, inH, w, h);
 			setsDirty = 1;
 		}
-		if (setsDirty)
+		lmUpdate();
+		if (setsDirty || R.lmSetsDirty)
 		{
 			vkDeviceWaitIdle(R.dev);
 			writeSets();
 			setsDirty = 0;
+			R.lmSetsDirty = 0;
 		}
 		double tSetup = nowMs();
 		if (R.levelPrep)
@@ -4998,6 +5394,10 @@ int main(int argc, char **argv)
 		R.hdr->frameDone = req;
 		futexWake(&R.hdr->frameDone);
 		lastDone = req;
+		if (!R.lmSetsDirty)
+		{
+			lmBakeStep(); // (the game has its frame; the lightmap bakes on before the next)
+		}
 	}
 	logf_("exit");
 	return 0;
