@@ -3722,7 +3722,10 @@ int main(int argc, char **argv)
 		}
 	}
 
-	int fd = shm_open(argv[1], O_RDWR, 0600);
+	// (started again after a crash, ctr_native's Rtx_RendererExited: the shared
+	// memory's name is gone, it passes its own descriptor's /proc path)
+	int byPath = !strncmp(argv[1], "/proc/", 6);
+	int fd = byPath ? open(argv[1], O_RDWR) : shm_open(argv[1], O_RDWR, 0600);
 	if (fd < 0)
 	{
 		logf_("shm_open %s: %s", argv[1], strerror(errno));
@@ -3734,7 +3737,10 @@ int main(int argc, char **argv)
 		logf_("mmap: %s", strerror(errno));
 		return 1;
 	}
-	shm_unlink(argv[1]); // both sides have it mapped; nothing leaks if either crashes
+	if (!byPath)
+	{
+		shm_unlink(argv[1]); // both sides have it mapped; nothing leaks if either crashes
+	}
 	R.hdr = (struct RtxHeader *)R.shm;
 	if ((R.hdr->magic != RTX_MAGIC) || (R.hdr->version != RTX_VERSION))
 	{

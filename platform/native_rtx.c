@@ -21,6 +21,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 extern char **environ;
@@ -98,6 +99,7 @@ static struct
 	u8 *base;
 	struct RtxHeader *hdr;
 	pid_t rendererPid;
+	int rendererRan; // (it got ready once: started again if it dies)
 	int enabled;   // F7
 	int debugView; // F6
 	struct RtxSettings settings; // F12 overlay keys 1-8, CTR_RTX_* env
@@ -263,8 +265,46 @@ static struct RtxDynTri *Rtx_DynTris(void) { return (struct RtxDynTri *)(s_rtx.b
 
 static void Rtx_InitSettings(void);
 
+// the renderer draws: ray tracing on, or a Nitro-Fueled track with it off (its
+// baked look: the GL path has no NF mesh, only the host's PS1 level)
+static int Rtx_Drawing(void)
+{
+	struct MTEntry *e = MT_ActiveEntry();
+	return s_rtx.enabled || ((e != NULL) && (e->flags & MT_FLAG_REMASTER));
+}
+
+// starts the renderer process on the shared memory (again after it died:
+// Rtx_RendererExited)
+static int Rtx_SpawnRenderer(void)
+{
+	char exe[1024], shm[64];
+	snprintf(exe, sizeof(exe), "%sctr_rtx", SDL_GetBasePath());
+	// (the renderer unlinks the shared memory's name once it has it mapped: a
+	// renderer started again opens it through this process' descriptor)
+	if (s_rtx.rendererRan)
+	{
+		snprintf(shm, sizeof(shm), "/proc/%d/fd/%d", (int)getpid(), s_rtx.fd);
+	}
+	else
+	{
+		snprintf(shm, sizeof(shm), "%s", s_rtx.shmName);
+	}
+	char *argv[] = {exe, shm, NULL};
+	pid_t pid;
+	int err = posix_spawn(&pid, exe, NULL, NULL, argv, environ);
+	if (err != 0)
+	{
+		printf("[RTX] could not start %s: %s (ray tracing off)\n", exe, strerror(err));
+		return 0;
+	}
+	s_rtx.rendererPid = pid;
+	printf("[RTX] renderer %s started (pid %d)\n", exe, (int)pid);
+	return 1;
+}
+
 void Rtx_Init(void)
 {
+	Rtx_InitSettings();
 	const char *env = SDL_getenv("CTR_RTX");
 	if ((env != NULL) && (env[0] == '0'))
 	{
@@ -298,29 +338,24 @@ void Rtx_Init(void)
 	RTX_HDR->gamePid = (u32)getpid();
 	RTX_HDR->redirectBase = -1;
 
-	char exe[1024];
-	snprintf(exe, sizeof(exe), "%sctr_rtx", SDL_GetBasePath());
-	char *argv[] = {exe, s_rtx.shmName, NULL};
-	pid_t pid;
-	int err = posix_spawn(&pid, exe, NULL, NULL, argv, environ);
-	if (err != 0)
+	if (!Rtx_SpawnRenderer())
 	{
-		printf("[RTX] could not start %s: %s (ray tracing off)\n", exe, strerror(err));
 		shm_unlink(s_rtx.shmName);
 		return;
 	}
-	s_rtx.rendererPid = pid;
-	s_rtx.enabled = 1;
+	s_rtx.enabled = NativeSettings_GetInt("rtx", 1) != 0;
+	const char *on = SDL_getenv("CTR_RTX_ON"); // (test harness: ray tracing on / off as F7, without touching settings.ini)
+	s_rtx.enabled = on ? (atoi(on) != 0) : s_rtx.enabled;
 	const char *view = SDL_getenv("CTR_RTX_VIEW"); // start in a debug view (as F6): 1 albedo, 2 normals, 3 direct, 4 indirect, 5 texture layer misses
 	s_rtx.debugView = view ? (atoi(view) % 8) : 0;
 	const char *mode = SDL_getenv("CTR_RTX_HYBRID"); // start in hybrid lighting (as F5)
 	s_rtx.lightMode = (mode && mode[0] == '1');
-	Rtx_InitSettings();
-	printf("[RTX] renderer %s started (pid %d): F7 ray tracing on/off, F5 hybrid/full lighting, F6 debug views\n", exe, (int)pid);
+	printf("[RTX] F7 ray tracing on/off, F5 hybrid/full lighting, F6 debug views\n");
 }
 
 void Rtx_Shutdown(void)
 {
+	Rtx_BakeShutdown();
 	if (RTX_HDR != NULL)
 	{
 		RTX_HDR->quit = 1;
@@ -3839,15 +3874,14 @@ int Rtx_RenderFrame(int outW, int outH, const u8 **rgba, const float **depth)
 			}
 			return 0;
 		}
-		if (kill(s_rtx.rendererPid, 0) != 0)
+		if (Rtx_RendererExited() || !RTX_HDR->rendererReady)
 		{
-			printf("[RTX] renderer exited, ray tracing off\n");
-			RTX_HDR->rendererReady = 0;
 			return 0;
 		}
 		Rtx_FutexWait(wait, v, 2000000); // (the renderer wakes it)
 	}
 	__sync_synchronize();
+	s_rtx.rendererRan = 1;
 	s_rtx.prevPipelined = s_rtx.settings.pipelined;
 	s_rtx.prevW = outW;
 	s_rtx.prevH = outH;
