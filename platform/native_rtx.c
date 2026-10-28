@@ -653,6 +653,10 @@ void Rtx_FrameBegin(void)
 	s_rtx.calZ = s_rtx.calB = 0.0;
 	s_rtx.calN = 0;
 	s_rtx.worldCapture = (RTX_HDR != NULL) && Rtx_Drawing() && RTX_HDR->rendererReady;
+	if (sdata->Loading.stage >= LOAD_TEN_STAGES_0)
+	{
+		s_rtx.levelValid = 0; // (a level loading over the one uploaded: uploaded again once it's in)
+	}
 	Rtx_LightmapFreeze();
 	s_rtx.statCaptured = s_rtx.statNoProj = s_rtx.statSemi = s_rtx.statInstances = s_rtx.statCulledTris = 0;
 	s_rtx.capSerial = 0;
@@ -1362,7 +1366,12 @@ static void Rtx_RefreshTexSlots(void)
 		}
 		if (ptr & 1)
 		{
-			group = *(const struct IconGroup4 **)(ptr - 1); // AnimTex: active frame
+			// AnimTex: its frame CTR_CycleTex picked, by its frame index (its active
+			// pointer isn't one until CycleTex has run on a level just loaded: a
+			// track's first frame, the "Bake now" tour loading one after another)
+			const struct AnimTex *anim = (const struct AnimTex *)(ptr - 1);
+			int n = anim->numFrames;
+			group = (n > 0) ? (ANIMTEX_GETARRAY(anim))[((anim->frameCurr % n) + n) % n] : NULL;
 		}
 		else
 		{
@@ -2677,7 +2686,17 @@ void Rtx_OnLevelCamera(struct PushBuffer *pb)
 	char key[sizeof(RTX_HDR->lightsKey)];
 	Rtx_LevelKey(key, sizeof(key));
 	int sameLevel = (s_rtx.levelPtr == level) && (s_rtx.meshPtr == level->ptr_mesh_info) && (s_rtx.levelID == gGT->levelID);
-	if (s_rtx.levelValid && !sameLevel && Rtx_HubWorldOn() && !strcmp(key, (const char *)RTX_HDR->lightsKey))
+	// (while a load is on its way the level drawn is the one uploaded: the next
+	// track's redirect may already be set, two custom tracks on one slot would
+	// take the old one's mesh under the new one's key, never uploaded again)
+	if (sdata->Loading.stage != LOAD_IDLE)
+	{
+		if (!s_rtx.levelValid)
+		{
+			return;
+		}
+	}
+	else if (s_rtx.levelValid && !sameLevel && Rtx_HubWorldOn() && !strcmp(key, (const char *)RTX_HDR->lightsKey))
 	{
 		// a hub swap inside the hub world: the traced world stays as it is; only
 		// the live level's animated textures (the texture layer's boosters) change
