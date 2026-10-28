@@ -2221,9 +2221,64 @@ void NativeRenderer_PresentVRAMDisplay(void)
 	NativeRenderer_PresentVRAMRect(activeDispEnv.disp.x, activeDispEnv.disp.y, activeDispEnv.disp.w, activeDispEnv.disp.h);
 }
 
+// MultiTrack: an RGBA texture from a PNG (track select screenshots), bilinear,
+// clamped; 0 when the file is missing or unreadable
+TextureID NativeRenderer_LoadImageTexture(const char *path, int *w, int *h)
+{
+	SDL_Surface *png = SDL_LoadPNG(path);
+	if (png == NULL)
+	{
+		return 0;
+	}
+	SDL_Surface *rgba = SDL_ConvertSurface(png, SDL_PIXELFORMAT_RGBA32);
+	SDL_DestroySurface(png);
+	if (rgba == NULL)
+	{
+		return 0;
+	}
+	GLuint tex = 0;
+	glGenTextures(1, &tex);
+	glActiveTexture(GL_TEXTURE0);
+	glBindTexture(GL_TEXTURE_2D, tex);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+	glPixelStorei(GL_UNPACK_ROW_LENGTH, rgba->pitch / 4);
+	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, rgba->w, rgba->h, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba->pixels);
+	glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+	s_lastBoundTexture = tex; // (what unit 0 now has bound: SetTexture skips rebinding it)
+	*w = rgba->w;
+	*h = rgba->h;
+	SDL_DestroySurface(rgba);
+	return tex;
+}
+
+void NativeRenderer_FreeImageTexture(TextureID texture)
+{
+	GLuint tex = texture;
+	if (tex == 0)
+	{
+		return;
+	}
+	if (s_lastBoundTexture == texture)
+	{
+		s_lastBoundTexture = (TextureID)-1;
+	}
+	glDeleteTextures(1, &tex);
+}
+
+static int s_shotRequested;
+
+void NativeRenderer_RequestShot(void)
+{
+	s_shotRequested = 1;
+}
+
 // MultiTrack debug: CTR_SHOT=<prefix> CTR_SHOT_FRAME=<n>[,<n>...] writes the
 // n-th presented frames as <prefix>-<n>.ppm and exits after the last one
-// (scripts/shot_native.py)
+// (scripts/shot_native.py); with CTR_SHOT_CLEAN=1 the frame the game asks for
+// (NativeRenderer_RequestShot) instead
 internal void NativeRenderer_DebugShot(void)
 {
 	static int s_frame;
@@ -2237,7 +2292,12 @@ internal void NativeRenderer_DebugShot(void)
 		s_numTargets = 0;
 		s_prefix = SDL_getenv("CTR_SHOT");
 		const char *frames = SDL_getenv("CTR_SHOT_FRAME");
-		if (s_prefix != NULL)
+		const char *clean = SDL_getenv("CTR_SHOT_CLEAN");
+		if ((s_prefix != NULL) && (clean != NULL) && (SDL_atoi(clean) != 0))
+		{
+			s_numTargets = 0; // (on request)
+		}
+		else if (s_prefix != NULL)
 		{
 			const char *c = frames ? frames : "600";
 			while (*c && s_numTargets < 32)
@@ -2256,7 +2316,8 @@ internal void NativeRenderer_DebugShot(void)
 	}
 
 	s_frame++;
-	if ((s_next >= s_numTargets) || (s_frame != s_targets[s_next]))
+	int requested = (s_prefix != NULL) && s_shotRequested;
+	if (!requested && ((s_next >= s_numTargets) || (s_frame != s_targets[s_next])))
 	{
 		return;
 	}
@@ -2286,7 +2347,7 @@ internal void NativeRenderer_DebugShot(void)
 	SDL_free(pixels);
 	printf("[MultiTrack] shot %s (%dx%d)\n", path, w, h);
 	fflush(stdout);
-	if (++s_next >= s_numTargets)
+	if (requested || (++s_next >= s_numTargets))
 	{
 		_Exit(0);
 	}
