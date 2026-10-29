@@ -24,15 +24,18 @@
 
 typedef struct
 {
-	s16 x, y, page, clut;
+	float x, y; // MultiTrack: float screen position (no PS1 vertex snapping: native_gte_core.c Pgxp_*)
+	s16 page, clut;
 
 	u8 u, v, bright, dither;
 	u8 r, g, b, a;
 
 	s8 tcx, tcy, _p0, _p1;
+
+	float viewZ; // MultiTrack: ray traced frame overlay depth test, 0 = none
 } GrVertex;
 
-CTR_STATIC_ASSERT(sizeof(GrVertex) == 20);
+CTR_STATIC_ASSERT(sizeof(GrVertex) == 28);
 
 typedef enum
 {
@@ -40,6 +43,8 @@ typedef enum
 	a_texcoord,
 	a_color,
 	a_extra,
+	a_depth, // MultiTrack
+	a_pageClut, // MultiTrack (a_position's zw before x / y were floats)
 } ShaderAttrib;
 
 typedef enum

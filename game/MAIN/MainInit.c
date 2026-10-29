@@ -114,7 +114,8 @@ static int MainInit_GetPrimMemSize(struct GameTracker *gGT)
 
 		if (levelID < GEM_STONE_VALLEY)
 		{
-			return data.primMem_SizePerLEV_1P[levelID] << 10;
+			// MultiTrack: 8x polygon budget, custom tracks overflow the stock one
+			return data.primMem_SizePerLEV_1P[levelID] << 13;
 		}
 
 		return 0x17c00;
@@ -122,7 +123,8 @@ static int MainInit_GetPrimMemSize(struct GameTracker *gGT)
 	case 2:
 		if (levelID < GEM_STONE_VALLEY)
 		{
-			return data.primMem_SizePerLEV_2P[levelID] << 10;
+			// MultiTrack: 4x polygon budget
+			return data.primMem_SizePerLEV_2P[levelID] << 12;
 		}
 
 		return 0x1e000;
@@ -131,7 +133,8 @@ static int MainInit_GetPrimMemSize(struct GameTracker *gGT)
 	case 4:
 		if (levelID < GEM_STONE_VALLEY)
 		{
-			return data.primMem_SizePerLEV_4P[levelID] << 10;
+			// MultiTrack: 4x polygon budget
+			return data.primMem_SizePerLEV_4P[levelID] << 12;
 		}
 
 		return 0x25800;
@@ -260,8 +263,11 @@ void MainInit_JitPoolsNew(struct GameTracker *gGT)
 #ifndef CTR_NATIVE
 	gGT->ptrRenderBucketInstance = MEMPACK_AllocMem(renderBucketSize, NULL);
 #else
-	// NOTE(aalhendi): Native reuses static RDATA scratch for existing PC memory headroom.
-	gGT->ptrRenderBucketInstance = (void *)((u32)&rdata.s_STATIC_GNORMALZ[0] + 148);
+	// MultiTrack: a buffer of its own, 4096 entries: with every level instance
+	// drawn (MainFrame_PcVisibility) the PS1's 0x800 bytes can overflow
+	static u32 s_renderBucket[0x2000];
+	gGT->ptrRenderBucketInstance = (void *)s_renderBucket;
+	(void)renderBucketSize;
 #endif
 
 	for (int i = 0; i < 3; i++)
@@ -551,6 +557,35 @@ void MainInit_FinalizeInit(struct GameTracker *gGT)
 				BOTS_Driver_Convert(gGT->drivers[i]);
 			}
 		}
+#ifdef CTR_NATIVE
+		// MultiTrack test harness (scripts/shot_native.py): CTR_AUTODRIVE=2 lets the AI drive player 1
+		{
+			// (only where the AI has paths to follow: not hubs, menus, arenas without them)
+			const char *autoDrive = getenv("CTR_AUTODRIVE");
+			int haveNav = 0;
+			for (int p = 0; (p < 3) && (gGT->level1 != NULL) && (gGT->level1->LevNavTable != NULL); p++)
+			{
+				haveNav |= (gGT->level1->LevNavTable[p] != NULL) && (sdata->NavPath_ptrHeader[p] != NULL) && (sdata->NavPath_ptrHeader[p]->numPoints > 0);
+			}
+			if ((autoDrive != NULL) && (autoDrive[0] == '2') && (gGT->drivers[0] != NULL) && haveNav)
+			{
+				BOTS_Driver_Convert(gGT->drivers[0]);
+			}
+			// CTR_BOOT_POS=x,y,z[,angle]: player 1 starts there (level units; angle 0-4095)
+			const char *bootPos = getenv("CTR_BOOT_POS");
+			int bx, by, bz, ba = 0;
+			if ((bootPos != NULL) && (gGT->drivers[0] != NULL) && (sscanf(bootPos, "%d,%d,%d,%d", &bx, &by, &bz, &ba) >= 3))
+			{
+				struct Driver *d = gGT->drivers[0];
+				d->posCurr.x = d->posPrev.x = bx << 8;
+				d->posCurr.y = d->posPrev.y = by << 8;
+				d->posCurr.z = d->posPrev.z = bz << 8;
+				d->angle = (s16)ba;
+				d->rotCurr.y = (s16)ba;
+				printf("[MultiTrack] boot position %d %d %d, angle %d\n", bx, by, bz, ba);
+			}
+		}
+#endif
 	}
 
 	// execute all camera thread update functions

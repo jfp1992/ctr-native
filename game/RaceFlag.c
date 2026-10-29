@@ -274,6 +274,16 @@ u32 *RaceFlag_GetOT(void)
 			}
 			if (order == RACE_FLAG_DRAW_ORDER_BEFORE_FLAG)
 				*(volatile s16 *)&sdata->RaceFlag_DrawOrder = rawOrder + 1;
+#ifdef CTR_NATIVE
+			// MultiTrack: behind everything only on the main menu (its backdrop):
+			// elsewhere the level may already draw while the flag still covers
+			// the screen (the end of a load), and cut into it
+			else if ((GAME_TRACKER->gameMode1 & MAIN_MENU) == 0)
+			{
+				struct GameTracker *gGT = GAME_TRACKER;
+				return gGT->otSwapchainDB[gGT->swapchainIndex];
+			}
+#endif
 			else
 				return GAME_TRACKER->pushBuffer[0].ptrOT + 0x3ff;
 		}
@@ -540,6 +550,183 @@ static inline u32 RaceFlag_ScreenSignMask(void)
 	return 0x80008000u;
 }
 
+#ifdef CTR_NATIVE
+#include <math.h>
+
+// MultiTrack: ray traced shading of the flag's cloth. The flag is a height
+// field in its own view space (35 columns 100 apart, 30 points down each 94
+// apart, z = the wave's depth); every grid point traces it: soft shadow rays
+// towards a key light (upper left, in front), hemisphere rays for the folds'
+// occlusion, a highlight and cloth sheen. The PS1 shades each column flat by
+// its slope; here every corner of every square gets its own light, the same
+// with ray tracing on and off.
+enum
+{
+	RACE_FLAG_COLUMNS = 35,
+	RACE_FLAG_POINT_DY = 94,
+	RACE_FLAG_COLUMN_DX = 100,
+	RACE_FLAG_TOP_Y = -910,
+};
+
+static struct
+{
+	s32 x0; // column 0's x
+	s16 z[RACE_FLAG_COLUMNS][RACE_FLAG_SCREEN_POINTS_PER_COLUMN];
+	int numQuads;
+	struct
+	{
+		POLY_G4 *poly;
+		u8 column, segment, dark;
+	} quads[RACE_FLAG_COLUMNS * RACE_FLAG_SCREEN_POINTS_PER_COLUMN];
+	float light[RACE_FLAG_COLUMNS][RACE_FLAG_SCREEN_POINTS_PER_COLUMN]; // diffuse + ambient
+	float spec[RACE_FLAG_COLUMNS][RACE_FLAG_SCREEN_POINTS_PER_COLUMN];
+} s_flagShade;
+
+#define RACE_FLAG_RECORD_Z(column, point, depth) (s_flagShade.z[(column)][(point)] = (s16)(depth))
+
+// the cloth's depth at flag-space x, y; 1e9 past its edges (nothing there)
+static float RaceFlag_ClothZ(float x, float y)
+{
+	float u = (x - (float)s_flagShade.x0) / RACE_FLAG_COLUMN_DX, v = (y - RACE_FLAG_TOP_Y) / RACE_FLAG_POINT_DY;
+	if ((u < 0.0f) || (v < 0.0f) || (u > RACE_FLAG_COLUMNS - 1) || (v > RACE_FLAG_SCREEN_POINTS_PER_COLUMN - 1))
+	{
+		return 1e9f;
+	}
+	int iu = (int)u, iv = (int)v;
+	iu = (iu > RACE_FLAG_COLUMNS - 2) ? RACE_FLAG_COLUMNS - 2 : iu;
+	iv = (iv > RACE_FLAG_SCREEN_POINTS_PER_COLUMN - 2) ? RACE_FLAG_SCREEN_POINTS_PER_COLUMN - 2 : iv;
+	float fu = u - iu, fv = v - iv;
+	float a = s_flagShade.z[iu][iv], b = s_flagShade.z[iu + 1][iv], c = s_flagShade.z[iu][iv + 1], d = s_flagShade.z[iu + 1][iv + 1];
+	return (a + (b - a) * fu) * (1.0f - fv) + (c + (d - c) * fu) * fv;
+}
+
+// a ray from p along d (unit) blocked by the cloth: some of it nearer the
+// viewer (smaller z) than the ray where the ray passes
+static int RaceFlag_ClothHit(const float *p, const float *d)
+{
+	for (float t = 18.0f; t < 520.0f; t += 22.0f)
+	{
+		float x = p[0] + d[0] * t, y = p[1] + d[1] * t, z = p[2] + d[2] * t;
+		if (RaceFlag_ClothZ(x, y) < z - 2.0f)
+		{
+			return 1;
+		}
+	}
+	return 0;
+}
+
+static void RaceFlag_Normalize(float *v)
+{
+	float l = sqrtf(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+	l = (l > 1e-6f) ? 1.0f / l : 0.0f;
+	v[0] *= l;
+	v[1] *= l;
+	v[2] *= l;
+}
+
+static void RaceFlag_NativeShade(void)
+{
+	// flag space: x right, y down, z away from the viewer (who looks along +z)
+	static const float key[3] = {-0.45f, -0.55f, -0.70f};
+	float L[3] = {key[0], key[1], key[2]}, H[3];
+	RaceFlag_Normalize(L);
+	H[0] = L[0];
+	H[1] = L[1];
+	H[2] = L[2] - 1.0f; // (half vector with the view direction -z)
+	RaceFlag_Normalize(H);
+	// the key light's disc (soft shadow edges) and the hemisphere (occlusion)
+	static float cone[6][3], hemi[16][3];
+	static int init;
+	if (!init)
+	{
+		init = 1;
+		float t[3] = {L[1], -L[0], 0.0f}, b[3];
+		RaceFlag_Normalize(t);
+		b[0] = L[1] * t[2] - L[2] * t[1];
+		b[1] = L[2] * t[0] - L[0] * t[2];
+		b[2] = L[0] * t[1] - L[1] * t[0];
+		for (int i = 0; i < 6; i++)
+		{
+			float a = 6.2831853f * i / 6.0f, r = 0.10f;
+			for (int k = 0; k < 3; k++)
+			{
+				cone[i][k] = L[k] + (t[k] * cosf(a) + b[k] * sinf(a)) * r;
+			}
+			RaceFlag_Normalize(cone[i]);
+		}
+		for (int i = 0; i < 16; i++)
+		{
+			// (Fibonacci points on the half facing the viewer)
+			float zc = (i + 0.5f) / 16.0f, r = sqrtf(1.0f - zc * zc), a = i * 2.39996323f;
+			hemi[i][0] = r * cosf(a);
+			hemi[i][1] = r * sinf(a);
+			hemi[i][2] = -zc;
+		}
+	}
+
+	for (int c = 0; c < RACE_FLAG_COLUMNS; c++)
+	{
+		for (int i = 0; i < RACE_FLAG_SCREEN_POINTS_PER_COLUMN; i++)
+		{
+			int c0 = (c > 0) ? c - 1 : c, c1 = (c < RACE_FLAG_COLUMNS - 1) ? c + 1 : c;
+			int i0 = (i > 0) ? i - 1 : i, i1 = (i < RACE_FLAG_SCREEN_POINTS_PER_COLUMN - 1) ? i + 1 : i;
+			float dzdx = (float)(s_flagShade.z[c1][i] - s_flagShade.z[c0][i]) / ((c1 - c0) * RACE_FLAG_COLUMN_DX);
+			float dzdy = (float)(s_flagShade.z[c][i1] - s_flagShade.z[c][i0]) / ((i1 - i0) * RACE_FLAG_POINT_DY);
+			float n[3] = {dzdx, dzdy, -1.0f};
+			RaceFlag_Normalize(n);
+			float p[3] = {(float)(s_flagShade.x0 + c * RACE_FLAG_COLUMN_DX), (float)(RACE_FLAG_TOP_Y + i * RACE_FLAG_POINT_DY), s_flagShade.z[c][i]};
+
+			float lit = 0.0f;
+			float ndl = n[0] * L[0] + n[1] * L[1] + n[2] * L[2];
+			if (ndl > -0.2f)
+			{
+				for (int k = 0; k < 6; k++)
+				{
+					lit += RaceFlag_ClothHit(p, cone[k]) ? 0.0f : 1.0f / 6.0f;
+				}
+			}
+			float open = 0.0f, weight = 0.0f;
+			for (int k = 0; k < 16; k++)
+			{
+				float w = n[0] * hemi[k][0] + n[1] * hemi[k][1] + n[2] * hemi[k][2];
+				if (w <= 0.05f)
+				{
+					continue;
+				}
+				weight += w;
+				open += RaceFlag_ClothHit(p, hemi[k]) ? 0.0f : w;
+			}
+			float ao = (weight > 0.0f) ? open / weight : 1.0f;
+			float wrap = (ndl + 0.3f) / 1.3f;
+			wrap = (wrap > 0.0f) ? wrap : 0.0f;
+			float sheen = 1.0f + n[2]; // (0 facing the viewer, more at grazing folds)
+			s_flagShade.light[c][i] = 0.34f * ao + 0.78f * wrap * lit + 0.25f * sheen * sheen * ao;
+			float ndh = n[0] * H[0] + n[1] * H[1] + n[2] * H[2];
+			ndh = (ndh > 0.0f) ? ndh : 0.0f;
+			s_flagShade.spec[c][i] = 0.30f * powf(ndh, 36.0f) * lit;
+		}
+	}
+	for (int q = 0; q < s_flagShade.numQuads; q++)
+	{
+		POLY_G4 *poly = s_flagShade.quads[q].poly;
+		int c = s_flagShade.quads[q].column, sgm = s_flagShade.quads[q].segment;
+		float albedo = s_flagShade.quads[q].dark ? 0.62f : 1.0f; // (the PS1's greys: 160 / 255 at full light)
+		// (corners: 0 / 2 the previous column, top / bottom; 1 / 3 this one)
+		int cc[4] = {c - 1, c, c - 1, c}, ci[4] = {sgm, sgm, sgm + 1, sgm + 1};
+		u8 *rgb[4] = {&poly->r0, &poly->r1, &poly->r2, &poly->r3};
+		for (int k = 0; k < 4; k++)
+		{
+			float v = albedo * s_flagShade.light[cc[k]][ci[k]] + s_flagShade.spec[cc[k]][ci[k]];
+			int o = (int)(v * 236.0f + 0.5f);
+			o = (o > 255) ? 255 : o;
+			rgb[k][0] = rgb[k][1] = rgb[k][2] = (u8)o;
+		}
+	}
+}
+#else
+#define RACE_FLAG_RECORD_Z(column, point, depth) ((void)0)
+#endif
+
 void RaceFlag_DrawSelf(void)
 {
 	SVECTOR positions[3];
@@ -610,12 +797,17 @@ SkipText:
 	positions[0].vx = flagPosition;
 	positions[1].vx = flagPosition;
 	positions[2].vx = flagPosition;
+#ifdef CTR_NATIVE
+	s_flagShade.x0 = flagPosition;
+	s_flagShade.numQuads = 0;
+#endif
 	for (row = 0; row < RACE_FLAG_SCREEN_ROWS; ++row)
 	{
 		for (firstPoint = 0; firstPoint < RACE_FLAG_SCREEN_POINTS_PER_ROW; ++firstPoint)
 		{
 			sine = RaceFlag_Sin(rippleAngle) + 4095;
 			positions[firstPoint].vz = depth + ((sine * 32) >> 13);
+			RACE_FLAG_RECORD_Z(0, row * RACE_FLAG_SCREEN_POINTS_PER_ROW + firstPoint, positions[firstPoint].vz);
 			rippleAngle += 300;
 		}
 
@@ -659,6 +851,7 @@ SkipText:
 		{
 			sine = RaceFlag_DecodeSine(rippleAngle, (s32)CTR_ReadU32AlignedLE(&RACE_FLAG_TRIG[rippleAngle & RACE_FLAG_TRIG_TABLE_MASK])) + 4095;
 			positions[point].vz = depth + ((sine * 32) >> 13);
+			RACE_FLAG_RECORD_Z(column, point, positions[point].vz);
 			rippleAngle += 300;
 		}
 
@@ -682,6 +875,7 @@ SkipText:
 					{
 						sine = RaceFlag_DecodeSine(rippleAngle, (s32)CTR_ReadU32AlignedLE(&RACE_FLAG_TRIG[rippleAngle & RACE_FLAG_TRIG_TABLE_MASK])) + 4095;
 						positions[point].vz = depth + ((sine * 32) >> 13);
+						RACE_FLAG_RECORD_Z(column, row * RACE_FLAG_SCREEN_POINTS_PER_ROW + point, positions[point].vz);
 						rippleAngle += 300;
 					}
 
@@ -761,6 +955,13 @@ SkipText:
 						setlen(poly, 8);
 						packed = packedRight;
 						setcode(poly, 0x38);
+#ifdef CTR_NATIVE
+						s_flagShade.quads[s_flagShade.numQuads].poly = poly;
+						s_flagShade.quads[s_flagShade.numQuads].column = (u8)column;
+						s_flagShade.quads[s_flagShade.numQuads].segment = (u8)segment;
+						s_flagShade.quads[s_flagShade.numQuads].dark = (((column >> 2) + (segment >> 2)) & 1) != 0;
+						s_flagShade.numQuads++;
+#endif
 						CTR_WriteU32AlignedLE(&poly->r1, packed);
 						CTR_WriteU32AlignedLE(&poly->r3, packed);
 						// NOTE(aalhendi): Preserve both tag length bytes while linking through native GPU tokens.
@@ -785,4 +986,7 @@ SkipText:
 	}
 
 	sdata->RaceFlag_ElapsedTime = (s32)(((u32)sdata->RaceFlag_ElapsedTime) + (GAME_TRACKER->elapsedTimeMS * 100));
+#ifdef CTR_NATIVE
+	RaceFlag_NativeShade();
+#endif
 }

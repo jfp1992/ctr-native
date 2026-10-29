@@ -50,6 +50,21 @@ void GhostReplay_ThTick(struct Thread *t)
 	{
 		goto hidden;
 	}
+	// MultiTrack: a tape something else wrote over (seen in Time Trial on NF
+	// Crash Cove, writer not found yet: scripts/run_native_watch.sh catches it)
+	// hides its ghost instead of reading through wild pointers
+	if ((tape->constDEADC0ED != 0xDEADC0ED) || (tape->ptrStart > tape->ptrEnd) ||
+	    (d->ghostBoolInit && (tape->ptrEnd != tape->ptrStart) && ((tape->ptrCurr < tape->ptrStart) || (tape->ptrCurr > tape->ptrEnd))))
+	{
+		static int s_reported;
+		if (!s_reported)
+		{
+			s_reported = 1;
+			printf("[MultiTrack] ghost %d's tape at %p is overwritten (canary %08x, start %p end %p cur %p): ghost hidden\n", d->ghostID, (void *)tape,
+			       (unsigned)tape->constDEADC0ED, tape->ptrStart, tape->ptrEnd, tape->ptrCurr);
+		}
+		goto hidden;
+	}
 	// NOTE(aalhendi): Valid tapes anchor their first position before any delta.
 	// Initialize native scratch state too, rather than expose stale stack data.
 	tmpPos.x = tmpPos.y = tmpPos.z = 0;

@@ -8,6 +8,7 @@
 #include "platform/native_input.h"
 #include "platform/native_log.h"
 #include "platform/native_perf.h"
+#include "platform/native_overlay.h"
 #include "platform/native_renderer.h"
 #include "platform/native_replay_scheduler.h"
 #include "platform/native_savestate.h"
@@ -113,14 +114,79 @@ internal void Platform_UpdateCursorVisibility(void)
 	}
 }
 
-internal void Platform_HandleFullscreenToggle(void)
-{
-	int fullscreen = (SDL_GetWindowFlags(g_window) & SDL_WINDOW_FULLSCREEN) != 0;
+// MultiTrack: display settings (main menu Settings, F11, settings.ini). The
+// resolution is the fullscreen display mode and the window's size; 0 x 0 =
+// the desktop's (fullscreen without a mode change, the window at its start size)
+#define PLATFORM_WINDOW_W 800
+#define PLATFORM_WINDOW_H 600
 
-	SDL_SetWindowFullscreen(g_window, fullscreen == 0);
+int Platform_GetDisplayModes(int *w, int *h, int max)
+{
+	int count = 0, n = 0;
+	SDL_DisplayMode **modes = SDL_GetFullscreenDisplayModes(SDL_GetDisplayForWindow(g_window), &count);
+	for (int i = 0; (modes != NULL) && (i < count) && (n < max); i++)
+	{
+		int seen = 0;
+		for (int j = 0; j < n; j++)
+		{
+			seen |= (w[j] == modes[i]->w) && (h[j] == modes[i]->h);
+		}
+		if (!seen)
+		{
+			w[n] = modes[i]->w;
+			h[n] = modes[i]->h;
+			n++;
+		}
+	}
+	SDL_free(modes);
+	return n; // (SDL lists them largest first)
+}
+
+void Platform_GetDisplay(int *w, int *h, int *fullscreen)
+{
+	*w = NativeSettings_GetInt("res_w", 0);
+	*h = NativeSettings_GetInt("res_h", 0);
+	*fullscreen = (SDL_GetWindowFlags(g_window) & SDL_WINDOW_FULLSCREEN) != 0;
+}
+
+void Platform_SetDisplay(int w, int h, int fullscreen)
+{
+	if (fullscreen)
+	{
+		// the mode of that size with the highest refresh rate (listed first)
+		const SDL_DisplayMode *pick = NULL;
+		int count = 0;
+		SDL_DisplayMode **modes = SDL_GetFullscreenDisplayModes(SDL_GetDisplayForWindow(g_window), &count);
+		for (int i = 0; (modes != NULL) && (i < count) && (pick == NULL) && (w > 0); i++)
+		{
+			pick = ((modes[i]->w == w) && (modes[i]->h == h)) ? modes[i] : NULL;
+		}
+		SDL_SetWindowFullscreenMode(g_window, pick); // (NULL: the desktop's)
+		SDL_free(modes);
+		SDL_SetWindowFullscreen(g_window, true);
+	}
+	else
+	{
+		SDL_SetWindowFullscreen(g_window, false);
+		SDL_SetWindowFullscreenMode(g_window, NULL);
+		SDL_SetWindowSize(g_window, (w > 0) ? w : PLATFORM_WINDOW_W, (h > 0) ? h : PLATFORM_WINDOW_H);
+	}
+	SDL_SyncWindow(g_window);
 	SDL_GetWindowSize(g_window, &g_windowWidth, &g_windowHeight);
 	Platform_UpdateCursorVisibility();
 	NativeRenderer_ResetDevice();
+
+	NativeSettings_SetInt("res_w", w);
+	NativeSettings_SetInt("res_h", h);
+	NativeSettings_SetInt("fullscreen", fullscreen != 0);
+	NativeSettings_Save();
+}
+
+internal void Platform_HandleFullscreenToggle(void)
+{
+	int w, h, fullscreen;
+	Platform_GetDisplay(&w, &h, &fullscreen);
+	Platform_SetDisplay(w, h, !fullscreen);
 }
 
 internal void Platform_UpdateHostAltKeyState(const s32 key, const s8 down)
@@ -169,6 +235,25 @@ internal void Platform_TakeScreenshot(void)
 
 internal void Platform_HandleKey(int key, char down)
 {
+	// MultiTrack: F12 debug overlay (keys 1-8 change the ray tracer's settings
+	// while it is open); F5 / F6 / F7 ray tracing, Shift+F5 / F6 / F7 the rest
+	const int shift = (SDL_GetModState() & SDL_KMOD_SHIFT) != 0;
+	if (Overlay_HandleKey(key, down, shift))
+	{
+		return;
+	}
+	if (down)
+	{
+		if (key == SDL_SCANCODE_F12)
+		{
+			Overlay_Toggle();
+		}
+		else if (!shift)
+		{
+			Rtx_HandleKey(key); // MultiTrack: F7 ray tracing, F5 lighting, F6 debug view
+		}
+	}
+
 	if (down == 0)
 	{
 		SubmitName_UseKeyboard(0);
@@ -209,10 +294,13 @@ internal void Platform_HandleKey(int key, char down)
 			NativeReplayScheduler_RequestStop();
 			break;
 		case SDL_SCANCODE_F7:
-			Platform_LogWarn("[CTR Native] saving VRAM.TGA\n");
-			NativeRenderer_SaveVRAM("VRAM.TGA", 0, 0, VRAM_WIDTH, VRAM_HEIGHT, 1);
+			if (shift) // MultiTrack: F7 alone is ray tracing on/off
+			{
+				Platform_LogWarn("[CTR Native] saving VRAM.TGA\n");
+				NativeRenderer_SaveVRAM("VRAM.TGA", 0, 0, VRAM_WIDTH, VRAM_HEIGHT, 1);
+			}
 			break;
-		case SDL_SCANCODE_F12:
+		case SDL_SCANCODE_PRINTSCREEN: // MultiTrack: F12 is the debug overlay
 			Platform_LogWarn("[CTR Native] Saving screenshot...\n");
 			Platform_TakeScreenshot();
 			break;
@@ -221,7 +309,10 @@ internal void Platform_HandleKey(int key, char down)
 			Platform_LogWarn("[CTR Native] filtering mode: %d\n", g_cfg_bilinearFiltering);
 			break;
 		case SDL_SCANCODE_F5:
-			NativeSaveState_RequestSave();
+			if (shift) // MultiTrack: F5 alone is the ray tracer's lighting mode
+			{
+				NativeSaveState_RequestSave();
+			}
 			break;
 		case SDL_SCANCODE_F8:
 			NativeSaveState_RequestLoad();
@@ -264,6 +355,11 @@ void Platform_Init(const char *title, int width, int height)
 	}
 
 	atexit(Platform_Shutdown);
+	// MultiTrack: the saved resolution / fullscreen
+	if (NativeSettings_GetInt("fullscreen", 0) || (NativeSettings_GetInt("res_w", 0) > 0))
+	{
+		Platform_SetDisplay(NativeSettings_GetInt("res_w", 0), NativeSettings_GetInt("res_h", 0), NativeSettings_GetInt("fullscreen", 0));
+	}
 	Platform_UpdateCursorVisibility();
 	Platform_InputInit();
 }
@@ -371,6 +467,12 @@ void Platform_EndScene(void)
 
 	// NOTE(aalhendi): Keep the displayed VRAM region current for screen-copy
 	// effects without forcing a CPU readback.
+	// MultiTrack: ray traced 3D layer
+	if (Rtx_FrameActive() && Rtx_SkyPhase())
+	{
+		Rtx_EndSkyPhase(); // nothing drawn over the sky this frame
+	}
+
 	NativeRenderer_StoreFrameBuffer(activeDispEnv.disp.x, activeDispEnv.disp.y, activeDispEnv.disp.w, activeDispEnv.disp.h);
 	NativeRenderer_PresentVRAMRect(activeDispEnv.disp.x, activeDispEnv.disp.y, activeDispEnv.disp.w, activeDispEnv.disp.h);
 	NativeRenderer_EndGpuFrame();
@@ -493,7 +595,7 @@ void Platform_PollHostEvents(void)
 				break;
 			}
 
-			if ((key == SDL_SCANCODE_F6) && (down == 0))
+			if ((key == SDL_SCANCODE_F6) && (down == 0) && ((SDL_GetModState() & SDL_KMOD_SHIFT) != 0)) // MultiTrack: F6 alone is the ray tracer's debug view
 			{
 #ifdef CTR_INTERNAL
 				int player = Platform_InputCycleGamepadController();

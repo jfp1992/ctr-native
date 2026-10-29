@@ -256,6 +256,35 @@ void LineSwapSourceVerts(VERTTYPE **p0, VERTTYPE **p1, u8 **c0, u8 **c1)
 	}
 }
 
+// MultiTrack: view z of each vertex of a ray traced frame's overlay (0 = not
+// depth tested); corners without their own projection take the packet's
+internal void NativeGpu_RtxDepth(GrVertex *vertex, int n, VERTTYPE *p0, VERTTYPE *p1, VERTTYPE *p2, VERTTYPE *p3)
+{
+	VERTTYPE *p[4] = {p0, p1, p2, p3};
+	float known = 0.0f;
+	for (int i = 0; i < 4; i++)
+	{
+		u32 xy = 0;
+		if (p[i] != NULL)
+		{
+			memcpy(&xy, p[i], sizeof(xy));
+		}
+		float z = (p[i] != NULL) ? Rtx_VertexDepth(xy) : 0.0f;
+		if (i < n)
+		{
+			vertex[i].viewZ = z;
+		}
+		known = (z > known) ? z : known;
+	}
+	for (int i = 0; i < n; i++)
+	{
+		if (vertex[i].viewZ <= 0.0f)
+		{
+			vertex[i].viewZ = known;
+		}
+	}
+}
+
 void MakeLineArray(GrVertex *vertex, VERTTYPE *p0, VERTTYPE *p1)
 {
 	const VERTTYPE dx = p1[0] - p0[0];
@@ -294,6 +323,22 @@ void MakeLineArray(GrVertex *vertex, VERTTYPE *p0, VERTTYPE *p1)
 		vertex[3].x = vertex[0].x + 1;
 		vertex[3].y = vertex[0].y;
 	} // TODO diagonal line alignment
+
+	NativeGpu_RtxDepth(vertex, 4, p0, p1, p1, p0);
+}
+
+// MultiTrack: a polygon corner where the GTE projected it, in float (Pgxp_*:
+// no PS1 vertex snapping), else as the packet has it
+internal void NativeGpu_VertexXY(GrVertex *v, VERTTYPE *p, float ofsX, float ofsY)
+{
+	float fx, fy;
+	if (!Pgxp_Lookup(p[0], p[1], &fx, &fy))
+	{
+		fx = (float)p[0];
+		fy = (float)p[1];
+	}
+	v->x = fx + ofsX;
+	v->y = fy + ofsY;
 }
 
 void MakeVertexTriangle(GrVertex *vertex, VERTTYPE *p0, VERTTYPE *p1, VERTTYPE *p2)
@@ -307,14 +352,11 @@ void MakeVertexTriangle(GrVertex *vertex, VERTTYPE *p0, VERTTYPE *p1, VERTTYPE *
 
 	memset(vertex, 0, sizeof(GrVertex) * 3);
 
-	vertex[0].x = p0[0] + ofsX;
-	vertex[0].y = p0[1] + ofsY;
+	NativeGpu_VertexXY(&vertex[0], p0, ofsX, ofsY);
+	NativeGpu_VertexXY(&vertex[1], p1, ofsX, ofsY);
+	NativeGpu_VertexXY(&vertex[2], p2, ofsX, ofsY);
 
-	vertex[1].x = p1[0] + ofsX;
-	vertex[1].y = p1[1] + ofsY;
-
-	vertex[2].x = p2[0] + ofsX;
-	vertex[2].y = p2[1] + ofsY;
+	NativeGpu_RtxDepth(vertex, 3, p0, p1, p2, NULL);
 }
 
 void MakeVertexQuad(GrVertex *vertex, VERTTYPE *p0, VERTTYPE *p1, VERTTYPE *p2, VERTTYPE *p3)
@@ -329,17 +371,12 @@ void MakeVertexQuad(GrVertex *vertex, VERTTYPE *p0, VERTTYPE *p1, VERTTYPE *p2, 
 
 	memset(vertex, 0, sizeof(GrVertex) * 4);
 
-	vertex[0].x = p0[0] + ofsX;
-	vertex[0].y = p0[1] + ofsY;
+	NativeGpu_VertexXY(&vertex[0], p0, ofsX, ofsY);
+	NativeGpu_VertexXY(&vertex[1], p1, ofsX, ofsY);
+	NativeGpu_VertexXY(&vertex[2], p2, ofsX, ofsY);
+	NativeGpu_VertexXY(&vertex[3], p3, ofsX, ofsY);
 
-	vertex[1].x = p1[0] + ofsX;
-	vertex[1].y = p1[1] + ofsY;
-
-	vertex[2].x = p2[0] + ofsX;
-	vertex[2].y = p2[1] + ofsY;
-
-	vertex[3].x = p3[0] + ofsX;
-	vertex[3].y = p3[1] + ofsY;
+	NativeGpu_RtxDepth(vertex, 4, p0, p1, p2, p3);
 }
 
 void MakeVertexRect(GrVertex *vertex, VERTTYPE *p0, s16 w, s16 h)
@@ -362,6 +399,8 @@ void MakeVertexRect(GrVertex *vertex, VERTTYPE *p0, s16 w, s16 h)
 
 	vertex[3].x = vertex[0].x + w;
 	vertex[3].y = vertex[0].y;
+
+	NativeGpu_RtxDepth(vertex, 4, p0, NULL, NULL, NULL);
 }
 
 void MakeTexcoordQuad(GrVertex *vertex, u8 *uv0, u8 *uv1, u8 *uv2, u8 *uv3, s16 page, s16 clut, u8 dither)
@@ -959,7 +998,7 @@ void DrawAllSplits()
 
 			NATIVE_GPU_LOG("%s\n", "==========================================");
 			NATIVE_GPU_LOG("POLYGON: %d\n", g_dbg_polygonSelected);
-			NATIVE_GPU_LOG("X: %d Y: %d\n", vert->x, vert->y);
+			NATIVE_GPU_LOG("X: %d Y: %d\n", (int)vert->x, (int)vert->y);
 			NATIVE_GPU_LOG("U: %d V: %d\n", vert->u, vert->v);
 			NATIVE_GPU_LOG("TP: %d CLT: %d\n", vert->page, vert->clut);
 
@@ -1069,6 +1108,12 @@ internal void NativeGpu_FormatPointerRegion(char *dst, size_t dstSize, uintptr_t
 	snprintf(dst, dstSize, "unknown");
 }
 
+// polygons, lines, sprites (not state commands, fills, transfers)
+static int NativeGpu_IsDrawCode(int code)
+{
+	return (code >= 0x20) && (code < 0x80);
+}
+
 void ParsePrimitivesLinkedList(u32 *p, int singlePrimitive)
 {
 	if (!p)
@@ -1105,11 +1150,54 @@ void ParsePrimitivesLinkedList(u32 *p, int singlePrimitive)
 	}
 	else
 	{
+		// MultiTrack: ray traced frame. The sky goes in the farthest OT bucket,
+		// but whatever lands there after it (far models, particles) is drawn
+		// before it, and the traced image would go under the sky. So first the
+		// sky packets, with the state commands among them (draw area, offset),
+		// in order up to the last sky packet; the walk below skips those
+		u8 *lastSky = NULL;
+		if (Rtx_FrameActive() && Rtx_SkyPhase())
+		{
+			for (u8 *sp = (u8 *)p;; sp = nextPrim(sp))
+			{
+				const int len = getlen(sp);
+				lastSky = ((len > 0) && (len <= 32) && Rtx_IsSkyPacket((u32 *)sp)) ? sp : lastSky;
+				if (isendprim(sp) || !NativeGpu_IsValidOTLink((uintptr_t)nextPrim(sp)))
+				{
+					break;
+				}
+			}
+			for (u8 *sp = (u8 *)p; lastSky != NULL; sp = nextPrim(sp))
+			{
+				const int len = getlen(sp);
+				if ((len > 0) && (len <= 32) && (Rtx_IsSkyPacket((u32 *)sp) || !NativeGpu_IsDrawCode(getcode(sp))))
+				{
+					u8 *cur = sp, *end = sp + (len + P_LEN) * sizeof(u32);
+					cur += (ParsePrimitive((P_TAG *)cur) + P_LEN) * sizeof(u32);
+					while (cur < end)
+					{
+						cur += ParseTaglessPrimitive((u32 *)cur) * sizeof(u32);
+					}
+					GPUDrawSplit *skySplit = &s_gpu.splits[s_gpu.splitIndex];
+					skySplit->numVerts = s_gpu.vertexIndex - skySplit->startVertex;
+				}
+				if (sp == lastSky)
+				{
+					break;
+				}
+			}
+		}
+		int beforeLastSky = (lastSky != NULL);
+
 		// walk OT_TAG linked list
 		u8 *basePacket = (u8 *)p;
 		while (true)
 		{
 			const int tagLength = getlen(basePacket);
+			if (Rtx_FrameActive())
+			{
+				Rtx_TrackPacket((u32 *)basePacket); // MultiTrack: OT bucket, for the overlay depth test
+			}
 			if (tagLength > 0)
 			{
 				if (tagLength > 32)
@@ -1126,7 +1214,35 @@ void ParsePrimitivesLinkedList(u32 *p, int singlePrimitive)
 				u8 *currentPacket = basePacket;
 				u8 *endPacket = basePacket + (tagLength + P_LEN) * sizeof(u32);
 				int primLength = 0;
-				if (currentPacket < endPacket)
+
+				// MultiTrack: ray traced frame. Level and captured model packets are
+				// traced instead; everything drawn before the first non-sky packet is
+				// the sky layer
+				if (Rtx_FrameActive())
+				{
+					const int rtxClass = Rtx_ClassifyPacket((u32 *)basePacket, tagLength);
+					const int code = getcode(basePacket);
+					const int early = beforeLastSky && ((rtxClass == RTX_PACKET_SKY) || !NativeGpu_IsDrawCode(code));
+					beforeLastSky = beforeLastSky && (basePacket != lastSky);
+					if ((rtxClass == RTX_PACKET_SKIP) || early)
+					{
+						currentPacket = endPacket; // (traced; or drawn above, with the sky)
+					}
+					else if ((rtxClass != RTX_PACKET_SKY) && Rtx_SkyPhase() && (code >= 0x20) && (code < 0x80))
+					{
+						DrawAllSplits();
+						Rtx_EndSkyPhase();
+					}
+				}
+
+				// MultiTrack: commands of a partly ray traced packet are skipped
+				const int rtxPartial = (currentPacket < endPacket) && Rtx_FrameActive();
+				int rtxSkip = rtxPartial ? Rtx_SkipCommand((u32 *)basePacket, (u32 *)basePacket + P_LEN) : 0;
+				if (rtxSkip > 0)
+				{
+					currentPacket += (rtxSkip + P_LEN) * sizeof(u32);
+				}
+				else if (currentPacket < endPacket)
 				{
 					primLength = ParsePrimitive((P_TAG *)currentPacket);
 					currentPacket += (primLength + P_LEN) * sizeof(u32);
@@ -1134,6 +1250,12 @@ void ParsePrimitivesLinkedList(u32 *p, int singlePrimitive)
 
 				while (currentPacket < endPacket)
 				{
+					rtxSkip = rtxPartial ? Rtx_SkipCommand((u32 *)basePacket, (u32 *)currentPacket) : 0;
+					if (rtxSkip > 0)
+					{
+						currentPacket += rtxSkip * sizeof(u32);
+						continue;
+					}
 					primLength = ParseTaglessPrimitive((u32 *)currentPacket);
 					currentPacket += primLength * sizeof(u32);
 				}

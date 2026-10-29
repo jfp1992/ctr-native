@@ -1,0 +1,101 @@
+#version 460
+// The remaster's dynamic vertices, every frame from rest (ctr_rtx.c refits /
+// rebuilds their BLASes afterwards):
+// - grass and foliage in the wind (Nitro-Fueled GrassOutdoor materials): by
+//   its sway (how far it may move: 0 at a palm's base, x1/1024 units) along the
+//   wind, a gust phase rolling over the ground (F.rem.w & 8; else at rest)
+// - animated nodes (propellers, fans, gears, wheels): node space vertex ->
+//   its keys (sampled node chain, looped over the period) -> G (model -> world)
+// - proxies (moving PS1 objects drawn as remaster models): the same, G into
+//   the PS1 model's space, then this frame's instance matrix (F.proxyM)
+// Output: position, normal and tangent (octahedral) per vertex.
+
+#include "common.glsl"
+
+layout(local_size_x = 64) in;
+
+uint octEncode(vec3 n)
+{
+	n /= max(abs(n.x) + abs(n.y) + abs(n.z), 1e-12);
+	vec2 e = (n.z < 0.0) ? (1.0 - abs(n.yx)) * vec2((n.x >= 0.0) ? 1.0 : -1.0, (n.y >= 0.0) ? 1.0 : -1.0) : n.xy;
+	return packSnorm2x16(e);
+}
+
+vec4 animRow(uint at) { return uintBitsToFloat(uvec4(remAnim[at], remAnim[at + 1u], remAnim[at + 2u], remAnim[at + 3u])); }
+
+void main()
+{
+	uint i = gl_GlobalInvocationID.x;
+	if (F.rem2.x + i >= F.rem2.y)
+	{
+		return;
+	}
+	uint v = F.rem2.x + i;
+	vec3 p;
+	uint nw, tw;
+	if (v < F.rem3.z)
+	{
+		p = vec3(uintBitsToFloat(remVerts[v * 8u]), uintBitsToFloat(remVerts[v * 8u + 1u]), uintBitsToFloat(remVerts[v * 8u + 2u]));
+		nw = remVerts[v * 8u + 5u];
+		tw = remVerts[v * 8u + 7u];
+		if ((F.rem.w & 8u) != 0u)
+		{
+			uint sp = tw;
+			float sway = float(sp & 0xffffu) / 1024.0;
+			float phase = float(sp >> 16) / 65535.0 * 6.2831853;
+			float t = F.wind.x, strength = F.wind.y;
+			vec2 dir = normalize(vec2(1.0, 0.35));
+			// leaning downwind, swaying about it; a little across
+			float along = 0.45 + 0.4 * sin(t * 1.9 + phase) + 0.15 * sin(t * 4.3 + phase * 2.3);
+			float across = 0.2 * sin(t * 2.7 + phase * 1.7);
+			vec2 off = (dir * along + vec2(-dir.y, dir.x) * across) * strength * sway;
+			p.xz += off;
+			p.y -= 0.25 * dot(off, off) / max(sway, 1.0); // (bending, not stretching)
+		}
+	}
+	else
+	{
+		// vertex: node space xyz, part, normal, tangent; part: G (3 rows), first
+		// key, keys, period, proxy slot + 1; keys: 3 rows each
+		uint vb = remAnim[2] + (v - F.rem3.z) * 6u;
+		vec3 q = uintBitsToFloat(uvec3(remAnim[vb], remAnim[vb + 1u], remAnim[vb + 2u]));
+		uint pb = 8u + remAnim[vb + 3u] * 16u;
+		uint k0 = remAnim[pb + 12u], kn = remAnim[pb + 13u], proxy = remAnim[pb + 15u];
+		float period = uintBitsToFloat(remAnim[pb + 14u]);
+		uint j = 0u;
+		float f = 0.0;
+		if ((kn > 1u) && (period > 0.0))
+		{
+			float x = fract(F.wind.x / period) * float(kn - 1u);
+			j = min(uint(x), kn - 2u);
+			f = x - float(j);
+		}
+		uint ka = remAnim[1] + (k0 + j) * 12u, kb = ka + ((kn > 1u) ? 12u : 0u);
+		vec4 K[3], G[3];
+		for (uint r = 0u; r < 3u; r++)
+		{
+			K[r] = mix(animRow(ka + r * 4u), animRow(kb + r * 4u), f);
+			G[r] = animRow(pb + r * 4u);
+		}
+		vec4 h = vec4(q, 1.0);
+		vec3 lp = vec3(dot(K[0], h), dot(K[1], h), dot(K[2], h));
+		p = vec3(dot(G[0], vec4(lp, 1.0)), dot(G[1], vec4(lp, 1.0)), dot(G[2], vec4(lp, 1.0)));
+		mat3 R = transpose(mat3(G[0].xyz, G[1].xyz, G[2].xyz)) * transpose(mat3(K[0].xyz, K[1].xyz, K[2].xyz));
+		if (proxy > 0u)
+		{
+			vec4 M0 = F.proxyM[(proxy - 1u) * 3u], M1 = F.proxyM[(proxy - 1u) * 3u + 1u], M2 = F.proxyM[(proxy - 1u) * 3u + 2u];
+			p = vec3(dot(M0, vec4(p, 1.0)), dot(M1, vec4(p, 1.0)), dot(M2, vec4(p, 1.0)));
+			R = transpose(mat3(M0.xyz, M1.xyz, M2.xyz)) * R;
+		}
+		// (rotation and uniform scale: normals as directions)
+		vec3 n = R * octDecode(remAnim[vb + 4u]);
+		vec3 tg = R * octDecode(remAnim[vb + 5u]);
+		nw = (dot(n, n) > 1e-12) ? octEncode(normalize(n)) : remAnim[vb + 4u];
+		tw = (dot(tg, tg) > 1e-12) ? ((octEncode(normalize(tg)) & ~0x10000u) | (remAnim[vb + 5u] & 0x10000u)) : remAnim[vb + 5u];
+	}
+	remGrass[i * 5u] = floatBitsToUint(p.x);
+	remGrass[i * 5u + 1u] = floatBitsToUint(p.y);
+	remGrass[i * 5u + 2u] = floatBitsToUint(p.z);
+	remGrass[i * 5u + 3u] = nw;
+	remGrass[i * 5u + 4u] = tw;
+}

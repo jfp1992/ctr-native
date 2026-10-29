@@ -99,6 +99,10 @@ int LOAD_TenStages(struct GameTracker *unusedGameTracker, int loadingStage, stru
 			{
 				VSync(0);
 				Platform_PresentVRAMDisplay();
+				if (Platform_InputSkipPressed()) // MultiTrack: X / A skips the boot intro
+				{
+					break;
+				}
 			}
 #endif
 
@@ -635,6 +639,7 @@ int LOAD_TenStages(struct GameTracker *unusedGameTracker, int loadingStage, stru
 			struct Level *lev = sdata->ptrLevelFile;
 			levelStoreTracker->level1 = lev;
 			levelStoreTracker->visMem1 = lev->visMem;
+			MT_Coll_OnLevelLoaded(lev); // MultiTrack: an NF track's own collision
 		}
 
 		if (GAME_TRACKER->level1 != 0)

@@ -1201,6 +1201,28 @@ static struct ModelHeader *RenderBucket_SelectModelHeader(struct Instance *inst,
 
 	// NOTE(aalhendi): Retail keeps the low 32 bits of this product before dividing by GTE H.
 	projectedDistance = (int)(u32)((s64)(pb->rect.w >> 1) * viewDepth) / pb->distanceToScreen_PREV;
+#ifdef CTR_NATIVE
+	// MultiTrack: only models in the players' views. HUD models pick their
+	// frame by depth (the race position's digit: 0x100 + rank, UI_RaceHudText)
+	struct GameTracker *lodTracker = sdata->gGT;
+	int worldView = (pb >= &lodTracker->pushBuffer[0]) && (pb < &lodTracker->pushBuffer[4]);
+	if (MainFrame_PcVisibilityOn() && worldView)
+	{
+		// MultiTrack: a PC draws every model at its full detail, at any distance:
+		// the PS1's lower detail models far off lack parts (glowing ones the ray
+		// tracer lights the track with, shadow casters), so the scene changed
+		// round the camera. The first header still enabled (cutscenes pick a
+		// model's header by zeroing the earlier ones' distances, CS_Thread)
+		for (int k = 0; k < inst->model->numHeaders; k++)
+		{
+			if ((u16)inst->model->headers[k].maxDistanceLOD != 0)
+			{
+				*lodIndexOut = k;
+				return &inst->model->headers[k];
+			}
+		}
+	}
+#endif
 	mh = inst->model->headers;
 	headersRemaining = inst->model->numHeaders;
 	lodIndex = 0;
@@ -1225,6 +1247,15 @@ static struct ModelHeader *RenderBucket_SelectModelHeader(struct Instance *inst,
 		}
 	}
 
+#ifdef CTR_NATIVE
+	if (MainFrame_PcVisibilityOn() && worldView && (lodIndex > 0))
+	{
+		// MultiTrack: past its last detail level the PS1 stops drawing a model
+		// (pop-in); a PC draws its lowest detail at any distance
+		*lodIndexOut = lodIndex - 1;
+		return mh - 1;
+	}
+#endif
 	*lodExhaustedOut = 1;
 	return 0;
 }
@@ -1742,6 +1773,51 @@ static int RenderBucket_ShouldAllocateSecondaryRange(u32 instFlags, const struct
 	return RenderBucket_HasSplitOutput(split);
 }
 
+// MultiTrack: per-player instances queued for the ray tracer only this frame
+static struct
+{
+	const void *idpp;
+	u32 frame;
+} sRtxOnly[1024];
+
+static u32 RenderBucket_RtxOnlyHash(const void *idpp)
+{
+	return (((u32)idpp * 0x9E3779B1u) >> 22) & 1023u;
+}
+
+static void RenderBucket_MarkRtxOnly(const void *idpp)
+{
+	u32 frame = (u32)sdata->gGT->timer;
+	for (u32 probe = 0, h = RenderBucket_RtxOnlyHash(idpp); probe < 64; probe++)
+	{
+		u32 i = (h + probe) & 1023u;
+		if ((sRtxOnly[i].frame != frame) || (sRtxOnly[i].idpp == idpp))
+		{
+			sRtxOnly[i].idpp = idpp;
+			sRtxOnly[i].frame = frame;
+			return;
+		}
+	}
+}
+
+static int RenderBucket_IsRtxOnly(const void *idpp)
+{
+	u32 frame = (u32)sdata->gGT->timer;
+	for (u32 probe = 0, h = RenderBucket_RtxOnlyHash(idpp); probe < 64; probe++)
+	{
+		u32 i = (h + probe) & 1023u;
+		if (sRtxOnly[i].frame != frame)
+		{
+			return 0;
+		}
+		if (sRtxOnly[i].idpp == idpp)
+		{
+			return 1;
+		}
+	}
+	return 0;
+}
+
 static int RenderBucket_BuildDepthRange(struct Instance *inst, struct ModelFrame *frame, struct ModelFrame *nextFrame, struct PushBuffer *pb,
                                         struct InstDrawPerPlayer *idpp, struct RenderBucketQueueState *queueState, int viewDepth, int normalDepthBias,
                                         int secondaryDepthBias, u32 *instFlags, const struct RenderBucketSplitState *split, const MATRIX *projectionMvp)
@@ -1758,7 +1834,11 @@ static int RenderBucket_BuildDepthRange(struct Instance *inst, struct ModelFrame
 	RenderBucket_UpdatePushBufferMetadata(pb, &bounds, instFlags);
 	if (RenderBucket_AcceptProjectedBounds(&bounds, pb, geomScreenHalf) == 0)
 	{
-		return 0;
+		// MultiTrack: out of view the PS1 skips the model; ray traced, it still
+		// casts its shadow, shows in reflections and glows: queued without an OT
+		// range, all its triangles go to the ray tracer only (not "drawn" for the
+		// game: tires, attached particles stay off)
+		return Rtx_WantsCulledTris() ? 2 : 0;
 	}
 
 	if ((*instFlags & RB_INSTANCE_SKIP_OT_RANGE) != 0)
@@ -2074,8 +2154,9 @@ static struct RenderBucketEntry *RenderBucket_QueueDraw(struct Instance *inst, s
 	RenderBucket_StoreMatrixWords(&idpp->m3x3, matrixState.m0, matrixState.m1, matrixState.m2, matrixState.m3, matrixState.m4);
 	split = RenderBucket_BuildSplitState(inst, mh, frame, nextFrame, pb, idpp, viewDepth, &queuedFlags, &matrixState, &projectionMvp);
 
-	if (RenderBucket_BuildDepthRange(inst, frame, nextFrame, pb, idpp, queueState, viewDepth, normalDepthBias, secondaryDepthBias, &queuedFlags, &split,
-	                                 &projectionMvp) == 0)
+	int depthRange = RenderBucket_BuildDepthRange(inst, frame, nextFrame, pb, idpp, queueState, viewDepth, normalDepthBias, secondaryDepthBias, &queuedFlags,
+	                                              &split, &projectionMvp);
+	if (depthRange == 0)
 	{
 		idpp->instFlags = queuedFlags;
 		return rbi;
@@ -2084,7 +2165,14 @@ static struct RenderBucketEntry *RenderBucket_QueueDraw(struct Instance *inst, s
 	RenderBucket_SelectRetailHandlers(&queuedFlags, &split, &drawFunc, &uncompressFunc);
 	rbi->inst = inst;
 	rbi->instPlayerBase = instPlayerBase;
-	queuedFlags |= DRAW_SUCCESSFUL;
+	if (depthRange == 2)
+	{
+		RenderBucket_MarkRtxOnly(idpp); // MultiTrack: out of view, ray traced only
+	}
+	else
+	{
+		queuedFlags |= DRAW_SUCCESSFUL;
+	}
 	idpp->unkEC = drawFunc;
 	idpp->unkF0 = uncompressFunc;
 	RenderBucket_WriteInstanceCallbackLabels(inst, queuedFlags);
@@ -2613,6 +2701,11 @@ static int RenderBucket_CheckProjectedPrim(struct RenderBucketDrawContext *ctx, 
 {
 	int depthMac0;
 
+	if (Rtx_RtxOnlyInstance())
+	{
+		return 0; // MultiTrack: a model out of view, ray traced only: no packets
+	}
+
 	// NOTE(aalhendi): Source-backs the shared retail projection gate:
 	// flag reject, optional NCLIP, AVSZ3, screen-window reject, then MAC0.
 	if ((s32)(gteFlag << 13) < 0)
@@ -2652,6 +2745,42 @@ static int RenderBucket_CheckProjectedPrim(struct RenderBucketDrawContext *ctx, 
 	return 1;
 }
 
+static struct TextureLayout *RenderBucket_GetCommandTexture(struct RenderBucketDrawContext *ctx, u32 command, int *isValid);
+
+// MultiTrack: a triangle the PS1 culls (back face, off screen, behind the
+// camera, or its whole model out of view) still goes to the ray tracer: its
+// corners in model space, the GTE's model -> view transform, texture, colours
+static void RenderBucket_RtxCulledTri(struct RenderBucketDrawContext *ctx, u32 command)
+{
+	if (!Rtx_WantsCulledTris())
+	{
+		return;
+	}
+	int isValid;
+	struct TextureLayout *tex = RenderBucket_GetCommandTexture(ctx, command, &isValid);
+	if (isValid == 0)
+	{
+		return;
+	}
+	u32 rt[8], xy[3], z[3], words[3] = {0, 0, 0};
+	for (int i = 0; i < 8; i++)
+	{
+		rt[i] = CFC2(i);
+	}
+	for (int v = 0; v < 3; v++)
+	{
+		xy[v] = ctx->tempPacked[1 + v].xy;
+		z[v] = ctx->tempPacked[1 + v].z;
+	}
+	if (tex != 0)
+	{
+		words[0] = RenderBucket_ReadTextureWord(tex, RENDER_BUCKET_TEX_WORD0_OFFSET);
+		words[1] = RenderBucket_ReadTextureWord(tex, RENDER_BUCKET_TEX_WORD1_OFFSET);
+		words[2] = RenderBucket_ReadTextureWord(tex, RENDER_BUCKET_TEX_WORD2_OFFSET);
+	}
+	Rtx_CaptureCulledTri(rt, xy, z, tex != 0, words, &ctx->tempColor[1]);
+}
+
 static int RenderBucket_ProjectPrim_Normal(struct RenderBucketDrawContext *ctx, u32 command, int useRtps, int reuseFirstVertex, int *depthMac0Out)
 {
 	if (useRtps != 0)
@@ -2663,7 +2792,43 @@ static int RenderBucket_ProjectPrim_Normal(struct RenderBucketDrawContext *ctx, 
 		RenderBucket_LoadPrimRTPT(ctx);
 	}
 
-	return RenderBucket_CheckProjectedPrim(ctx, command, CFC2(31), 0, depthMac0Out);
+	// (CTR_RTX_CHECK_CULLED: how far the culled-triangle maths lands from the
+	// GTE's own view position of the last vertex projected, MAC1-3)
+	static int s_check = -1;
+	if (s_check < 0)
+	{
+		s_check = getenv("CTR_RTX_CHECK_CULLED") != NULL;
+	}
+	if (s_check)
+	{
+		s32 mac[3] = {(s32)MFC2(25), (s32)MFC2(26), (s32)MFC2(27)};
+		u32 rt[8];
+		for (int i = 0; i < 8; i++)
+		{
+			rt[i] = CFC2(i);
+		}
+		s16 r[9] = {(s16)rt[0], (s16)(rt[0] >> 16), (s16)rt[1], (s16)(rt[1] >> 16), (s16)rt[2], (s16)(rt[2] >> 16), (s16)rt[3], (s16)(rt[3] >> 16), (s16)rt[4]};
+		float m[3] = {(float)(s16)ctx->tempPacked[3].xy, (float)(s16)(ctx->tempPacked[3].xy >> 16), (float)(s16)ctx->tempPacked[3].z};
+		static float s_maxErr;
+		static int s_n;
+		for (int k = 0; k < 3; k++)
+		{
+			float v = (float)(s32)rt[5 + k] + (r[k * 3] * m[0] + r[k * 3 + 1] * m[1] + r[k * 3 + 2] * m[2]) / 4096.0f;
+			float e = v - (float)mac[k];
+			e = (e < 0.0f) ? -e : e;
+			s_maxErr = (e > s_maxErr) ? e : s_maxErr;
+		}
+		if ((++s_n % 20000) == 0)
+		{
+			printf("[RTX] culled-triangle maths vs GTE: max error %.2f units over %d vertices\n", s_maxErr, s_n);
+		}
+	}
+	int accepted = RenderBucket_CheckProjectedPrim(ctx, command, CFC2(31), 0, depthMac0Out);
+	if (accepted == 0)
+	{
+		RenderBucket_RtxCulledTri(ctx, command); // MultiTrack
+	}
+	return accepted;
 }
 
 static void RenderBucket_InitSplitVertex(struct RenderBucketDrawContext *ctx, int slot, u32 packedXY, u32 packedZ, int color)
@@ -5125,7 +5290,7 @@ static int RenderBucket_PrepareDrawContext(struct RenderBucketDrawContext *ctx, 
 		return 0;
 	}
 
-	if ((idpp->instFlags & 0x40) == 0)
+	if (((idpp->instFlags & 0x40) == 0) && !RenderBucket_IsRtxOnly(idpp)) // (MultiTrack: or out of view, ray traced only)
 	{
 		return 0;
 	}
@@ -5234,7 +5399,49 @@ void RenderBucket_Execute(void *param_1, struct PrimMem *param_2)
 		{
 			continue;
 		}
+		// MultiTrack: track select screenshots: no HUD models (position number, wumpa, ...)
+		if (MT_ShotClean() && (ctx.pb != &sdata->gGT->pushBuffer[0]))
+		{
+			continue;
+		}
 
+		// MultiTrack: capture for ray tracing (a model out of view: its triangles,
+		// through the plain draw functions, for the ray tracer only)
+		int rtxOnly = RenderBucket_IsRtxOnly(ctx.idpp);
+		u32 drawFunc = (u32)ctx.idpp->unkEC;
+		{
+			// (CTR_RTX_DEBUG: models out of view by draw function, every 300 frames)
+			static int s_dbg = -1, s_frames;
+			static u32 s_lastTimer;
+			static int s_count[8];
+			if (s_dbg < 0)
+			{
+				s_dbg = getenv("CTR_RTX_DEBUG") != NULL;
+			}
+			if (s_dbg && rtxOnly)
+			{
+				s_count[(drawFunc == (u32)RB_RETAIL_DRAWFUNC_NORMAL) ? 0 : (drawFunc == (u32)RB_RETAIL_DRAWFUNC_NORMAL_ALT) ? 1 : (drawFunc == (u32)RB_RETAIL_DRAWFUNC_SPLIT) ? 2 : (drawFunc == (u32)RB_RETAIL_DRAWFUNC_SPECIAL) ? 3 : (drawFunc == (u32)RB_RETAIL_DRAWFUNC_REFLECTION) ? 4 : 5]++;
+			}
+			if (s_dbg && ((u32)sdata->gGT->timer != s_lastTimer))
+			{
+				s_lastTimer = (u32)sdata->gGT->timer;
+				if ((++s_frames % 300) == 0)
+				{
+					printf("[RTX]   models out of view by draw function: normal %d, alt %d, split %d, special %d, reflection %d, other %d\n", s_count[0], s_count[1],
+					       s_count[2], s_count[3], s_count[4], s_count[5]);
+					memset(s_count, 0, sizeof(s_count));
+				}
+			}
+		}
+		if (rtxOnly && (drawFunc != (u32)RB_RETAIL_DRAWFUNC_NORMAL) && (drawFunc != (u32)RB_RETAIL_DRAWFUNC_NORMAL_ALT) &&
+		    (drawFunc != (u32)RB_RETAIL_DRAWFUNC_SPLIT))
+		{
+			continue;
+		}
+		Rtx_SetRtxOnlyInstance(rtxOnly);
+		Rtx_BeginInstance(param_2, ctx.inst, ctx.pb, ctx.idpp->mvp.t);
 		RenderBucket_DispatchDrawFunc(&ctx);
+		Rtx_EndTag(param_2);
+		Rtx_SetRtxOnlyInstance(0);
 	}
 }

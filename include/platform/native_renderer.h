@@ -40,6 +40,11 @@ void NativeRenderer_SetPSXDrawMaskSet(int maskSet);
 void NativeRenderer_UpdateVertexBuffer(const GrVertex *vertices, int count);
 void NativeRenderer_DrawTriangles(int startVertex, int triangles);
 void NativeRenderer_PushDebugLabel(const char *label);
+// MultiTrack: an RGBA texture from a PNG file (0 = none; *w, *h its size)
+TextureID NativeRenderer_LoadImageTexture(const char *path, int *w, int *h);
+void NativeRenderer_FreeImageTexture(TextureID texture);
+// MultiTrack: CTR_SHOT_CLEAN screenshots: write the next presented frame and exit
+void NativeRenderer_RequestShot(void);
 void NativeRenderer_PopDebugLabel(void);
 
 #endif

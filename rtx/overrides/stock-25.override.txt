@@ -1,0 +1,4 @@
+# Gem Stone Valley (Adventure hub): rt_bake's openness test calls it indoor (doorways,
+# overhangs and tunnels between areas cover most of the ground), but it is
+# open to the sky: sun fitted to its vertex colours + sky
+indoor 0

@@ -1,0 +1,57 @@
+#version 460
+// Baked mode (ray tracing off on a Nitro-Fueled track): once per track, the
+// light at every remaster vertex, as the tracer would gather it there (direct
+// light with shadows, one diffuse bounce or the sky), REMBAKE_SAMPLES each.
+// trace.comp then lights remaster surfaces from it and sends no rays of its own.
+// ctr_rtx.c runs it in chunks (push constant: first vertex) and caches the result.
+
+#include "common.glsl"
+
+layout(local_size_x = 64) in;
+layout(push_constant) uniform Push { int first; } pc;
+
+const uint REMBAKE_SAMPLES = 64u;
+
+void main()
+{
+	uint v = gl_GlobalInvocationID.x + uint(pc.first);
+	if (v >= F.rem2.y)
+	{
+		return;
+	}
+	vec3 n = remNormal(v);
+	if (dot(n, n) < 1e-12)
+	{
+		remBake[v] = vec4(0.0);
+		return;
+	}
+	n = normalize(n);
+	vec3 p = remPos(v);
+	uint rng = (v * 9781u + 6271u) | 1u;
+	pcg(rng);
+	float eps = rayEps(p);
+	float aoRadius = (F.ambient.w > 0.5) ? F.params.x : 1e8;
+	vec3 sum = vec3(0.0);
+	for (uint i = 0u; i < REMBAKE_SAMPLES; i++)
+	{
+		g_remSurf = true;
+		sum += lightSample(p + n * eps, n, n, false, rng);
+		vec3 d = cosineSample(n, rng);
+		uint inst, prim;
+		vec2 bary;
+		g_fastRays = true;
+		float t = traceClosest(p + n * eps, d, aoRadius, false, inst, prim, bary);
+		g_fastRays = false;
+		if (t < 0.0)
+		{
+			sum += skyRadiance(d);
+		}
+		else
+		{
+			Surface s = surfaceAt(inst, prim, bary, d);
+			g_remSurf = inst >= INST_REM;
+			sum += s.albedo * lightSample(s.shadowPos, s.normal, s.geoNormal, s.dynamic, rng) + s.emission / max(F.sunColor.w, 1e-3);
+		}
+	}
+	remBake[v] = vec4(sum / float(REMBAKE_SAMPLES), 1.0);
+}

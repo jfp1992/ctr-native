@@ -26,6 +26,11 @@ int Platform_GetVBlankCount(void);
 void Platform_WaitUntilVBlank(int targetVBlank);
 void Platform_PollHostEvents(void);
 int Platform_PollInput(void);
+int Platform_InputSkipPressed(void); // MultiTrack: cross / gamepad A went down (boot intro skip)
+// MultiTrack: display settings (main menu Settings, F11); w x h 0 x 0 = the desktop's
+int Platform_GetDisplayModes(int *w, int *h, int max); // distinct sizes, largest first
+void Platform_GetDisplay(int *w, int *h, int *fullscreen);
+void Platform_SetDisplay(int w, int h, int fullscreen);
 
 #if defined(CTR_NATIVE)
 int NikoGetEnterKey(void);
